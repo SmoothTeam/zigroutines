@@ -222,7 +222,6 @@ pub const WorkStealingScheduler = struct {
         const t = w.running orelse @panic("zigroutines: park with no running task");
         t.state = .blocked;
         t.blocked_on = reason;
-        // Allow a subsequent wake to claim `scheduled` again.
         t.scheduled.store(false, .release);
         if (self.metrics) |m| m.inc(.parks);
         context.swap(&t.ctx, &w.sched_ctx);

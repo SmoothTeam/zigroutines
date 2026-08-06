@@ -5,6 +5,7 @@ zigroutines — explicit **stackful M:N** concurrency for Zig: Go-shaped tasks, 
 | | |
 |--|--|
 | **Version** | **1.0.0** (`build.zig.zon` · `zr.version`) |
+| **License** | **MIT** ([LICENSE](LICENSE)) |
 | **Platforms** | **x86_64 / aarch64** · Windows, Linux, macOS, FreeBSD |
 | **Zig** | **0.16** and **0.17-dev** |
 

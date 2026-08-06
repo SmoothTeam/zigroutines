@@ -151,7 +151,6 @@ pub const PriorityScheduler = struct {
 
     pub fn yieldFromRunning(self: *PriorityScheduler) void {
         const t = self.running orelse @panic("zigroutines: yield with no running task");
-        // Direct re-queue (bypass idempotent enqueue which would no-op if scheduled).
         t.state = .ready;
         t.scheduled.store(true, .release);
         self.ready.push(t.priority, t) catch @panic("zigroutines: OOM on yield enqueue");

@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run micro-benchmarks (use -Doptimize=ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
-    // Examples — build all, optional run via -Dexample=name
+    // Examples
     const example_files = [_][]const u8{
         "01_minimal_spawn",
         "02_channel_pipeline",
@@ -107,7 +107,6 @@ pub fn build(b: *std.Build) void {
         examples_step.dependOn(&install_ex.step);
     }
 
-    // Convenience: zig build example -Dexample=01_minimal_spawn
     const example_name = b.option([]const u8, "example", "Example name without .zig (e.g. 01_minimal_spawn)");
     if (example_name) |ename| {
         const path = b.fmt("examples/{s}.zig", .{ename});
