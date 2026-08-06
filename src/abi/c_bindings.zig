@@ -12,10 +12,10 @@ fn cAllocator() std.mem.Allocator {
 pub const zr_runtime = opaque {};
 
 export fn zr_version_major() c_uint {
-    return 0;
+    return 1;
 }
 export fn zr_version_minor() c_uint {
-    return 7;
+    return 0;
 }
 export fn zr_version_patch() c_uint {
     return 0;

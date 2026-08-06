@@ -504,6 +504,7 @@ test "io_uring backend create/destroy" {
     try std.testing.expect(rt.ioBackend() != null);
 }
 
-test "version at least standards" {
-    try std.testing.expect(zr.version.minor >= 8);
+test "version is at least 1.0.0" {
+    try std.testing.expectEqual(@as(u32, 1), zr.version.major);
+    try std.testing.expect(zr.version.minor >= 0);
 }

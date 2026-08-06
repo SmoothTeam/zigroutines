@@ -1,10 +1,10 @@
 const std = @import("std");
 
 pub const version = Version{
-    .major = 0,
-    .minor = 10,
+    .major = 1,
+    .minor = 0,
     .patch = 0,
-    .phase = .pre_1_0,
+    .phase = .stable,
 };
 
 pub const Version = struct {
@@ -24,9 +24,14 @@ pub const Version = struct {
         standards,
         io_complete,
         pre_1_0,
+        stable,
     };
 
     pub fn format(self: Version, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.phase == .stable) {
+            try writer.print("{d}.{d}.{d}", .{ self.major, self.minor, self.patch });
+            return;
+        }
         try writer.print("{d}.{d}.{d}-{s}", .{
             self.major,
             self.minor,

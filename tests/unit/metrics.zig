@@ -43,7 +43,8 @@ test "metrics counts spawns yields finishes" {
     try std.testing.expect(s.yields >= 4);
 }
 
-test "version major remains 0" {
-    try std.testing.expectEqual(@as(u32, 0), zr.version.major);
-    try std.testing.expect(zr.version.minor >= 7);
+test "version is 1.0.0" {
+    try std.testing.expectEqual(@as(u32, 1), zr.version.major);
+    try std.testing.expectEqual(@as(u32, 0), zr.version.minor);
+    try std.testing.expectEqual(@as(u32, 0), zr.version.patch);
 }

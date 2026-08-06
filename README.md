@@ -1,8 +1,12 @@
 # zigroutines
 
- **x86_64 / aarch64** · Windows, Linux, macOS, FreeBSD
+zigroutines — explicit **stackful M:N** concurrency for Zig: Go-shaped tasks, channels, and `select`, with a Runtime you construct yourself.
 
-Supported toolchains: **Zig 0.16** and **Zig 0.17-dev**
+| | |
+|--|--|
+| **Version** | **1.0.0** (`build.zig.zon` · `zr.version`) |
+| **Platforms** | **x86_64 / aarch64** · Windows, Linux, macOS, FreeBSD |
+| **Zig** | **0.16** and **0.17-dev** |
 
 ```bash
 zig build test
@@ -58,7 +62,7 @@ At a glance:
 
 | | **libxev** | **zigcoro / zio** | **zigroutines** |
 |--|------------|-------------------|-----------------|
-| Primary job | Event loop / completions | Coroutines + some I/O | **Full concurrency product** |
+| Primary job | Event loop / completions | Coroutines + some I/O | **Full concurrency stack** |
 | Stackful sync style | No (callback / future) | Yes | **Yes** |
 | Channels + multi-select | No | Partial / ad-hoc | **First-class CSP** |
 | Pluggable scheduler policies | N/A | Limited | **FIFO / WS / priority / 1:1** |
@@ -83,7 +87,7 @@ Go wins “ship a service in an afternoon.” zigroutines wins when you **cannot
 
 ### 1.4. Why choose this
 
-1. **Policy-complete** — scheduler, I/O, cancel, CSP, stacks, metrics: one coherent surface.
+1. **One coherent surface** — scheduler, I/O, cancel, CSP, stacks, metrics: policies you enable, not a hidden runtime.
 2. **Honest to Zig** — no process-global runtime, no GC, no silent growth; pay only for enabled features.
 3. **Go-shaped DX** — write top-down; park on channels/timers/I/O without rewriting the call tree.
 4. **Measurable cost** — fixed stacks, optional metrics/canary, explicit park/wake rules.
@@ -92,7 +96,23 @@ Go wins “ship a service in an afternoon.” zigroutines wins when you **cannot
 
 ### 1.5. How to depend on it in your project
 
+Package version: **1.0.0**. Repository: [Apanazar/zigroutines](https://github.com/Apanazar/zigroutines).
+
 #### Via `build.zig.zon` (recommended)
+
+Pin a release (hash is filled by `zig fetch --save`):
+
+```bash
+zig fetch --save=zigroutines https://github.com/Apanazar/zigroutines/archive/refs/tags/v1.0.0.tar.gz
+```
+
+Or from a local checkout:
+
+```bash
+zig fetch --save=zigroutines ./path/to/zigroutines
+```
+
+Then in `build.zig.zon` you will have something like:
 
 ```zig
 .{
@@ -100,12 +120,15 @@ Go wins “ship a service in an afternoon.” zigroutines wins when you **cannot
     .version = "0.0.1",
     .dependencies = .{
         .zigroutines = .{
-            .url = "https://github.com/.../...tar.gz",
+            .url = "https://github.com/Apanazar/zigroutines/archive/refs/tags/v1.0.0.tar.gz",
+            .hash = "…", // written by zig fetch --save
         },
     },
     .paths = .{""},
 }
 ```
+
+Wire the module in `build.zig`:
 
 ```zig
 const zr_dep = b.dependency("zigroutines", .{
@@ -113,12 +136,6 @@ const zr_dep = b.dependency("zigroutines", .{
     .optimize = optimize,
 });
 exe.root_module.addImport("zigroutines", zr_dep.module("zigroutines"));
-```
-
-Locally (path):
-
-```bash
-zig fetch --save=zigroutines ./path/to/zigroutines
 ```
 
 #### Import in code
@@ -134,7 +151,8 @@ try rt.run();
 
 #### Requirements
 
-- Zig **0.16** or **0.17-dev** (see also `minimum_zig_version` in `build.zig.zon` for the CI/dev pin)
+- **zigroutines 1.0.0**
+- Zig **0.16** or **0.17-dev** (see `minimum_zig_version` in `build.zig.zon` for the CI/dev pin)
 - Architectures with context-switch support: **x86_64**, **aarch64**
 - OS: Windows, Linux, macOS, FreeBSD
 
@@ -306,7 +324,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 | windows_api | Windows helpers | `src/utils/windows_api.zig` |
 
 
-### 2.5. Invariants (brief)
+### 2.4. Invariants (brief)
 
 1. Park/wake: waiter is marked `parked` **under the lock** before `parkFromRunning`; the waker waits for `!on_cpu` and only then `enqueue`.
 2. Channel close: all send/recv waiters get `Closed` and are woken.
@@ -566,3 +584,4 @@ C ABI / tracing hooks
 ```
 
 ---
+

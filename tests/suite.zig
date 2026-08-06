@@ -1,9 +1,9 @@
 const std = @import("std");
 const zr = @import("zigroutines");
 
-test "version is 0.10.x" {
-    try std.testing.expectEqual(@as(u32, 0), zr.version.major);
-    try std.testing.expectEqual(@as(u32, 10), zr.version.minor);
+test "version is 1.0.x" {
+    try std.testing.expectEqual(@as(u32, 1), zr.version.major);
+    try std.testing.expectEqual(@as(u32, 0), zr.version.minor);
 }
 
 test {
