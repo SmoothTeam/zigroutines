@@ -1,0 +1,17 @@
+.{
+    .name = .zigroutines,
+    .version = "1.0.0",
+    .fingerprint = 0x732de917571e200b,
+    .minimum_zig_version = "0.17.0-dev.1503+1f1bee62e",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "benchmarks",
+        "examples",
+        "docs",
+        "README.md",
+    },
+}
