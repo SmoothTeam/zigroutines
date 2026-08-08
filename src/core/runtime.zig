@@ -27,8 +27,8 @@ pub const SchedulerPolicy = enum {
 pub const Config = struct {
     workers: u32 = 1,
     policy: SchedulerPolicy = .auto,
-    default_stack_size: usize = stack_mod.default_stack_size,
     stack_pool: bool = true,
+    task_freelist: bool = true,
     stack_guard_page: bool = false,
     stack_paint_canary: bool = false,
     io: IoConfig = .none,
@@ -61,6 +61,7 @@ pub const Runtime = struct {
     config: Config,
     backend: SchedBackend,
     pool: ?stack_mod.Pool,
+    task_cache: task_mod.TaskCache,
     worker_count: u32,
     timers: timer_mod.TimerQueue,
     io: ?io_backend.Backend = null,
@@ -86,7 +87,7 @@ pub const Runtime = struct {
             workers = 1;
         }
         if (policy == .thread_per_task) {
-            workers = 0; // N threads = N tasks
+            workers = 0;
         }
         if (policy == .work_stealing and workers < 2) {
             workers = cpu_count;
@@ -140,6 +141,7 @@ pub const Runtime = struct {
             .config = config,
             .backend = backend,
             .pool = pool,
+            .task_cache = task_mod.TaskCache.init(allocator, config.task_freelist),
             .worker_count = if (policy == .thread_per_task) 0 else if (workers <= 1) 1 else workers,
             .timers = timer_mod.TimerQueue.init(allocator),
             .io = io,
@@ -225,6 +227,7 @@ pub const Runtime = struct {
             p.drain();
             p.deinit();
         }
+        self.task_cache.deinit();
         self.* = undefined;
     }
 
@@ -241,22 +244,23 @@ pub const Runtime = struct {
         return self.io;
     }
 
-    pub fn spawn(
-        self: *Runtime,
-        opts: task_mod.SpawnOptions,
-        comptime func: anytype,
-        args: std.meta.ArgsTuple(@TypeOf(func)),
-    ) !task_mod.JoinHandle {
+    fn spawnEnv(self: *Runtime) task_mod.SpawnEnv {
+        return .{
+            .executor = self.executor(),
+            .allocator = self.allocator,
+            .pool = if (self.pool) |*p| p else null,
+            .cache = if (self.config.task_freelist) &self.task_cache else null,
+        };
+    }
+
+    fn prepareSpawnOpts(self: *Runtime, opts: task_mod.SpawnOptions) task_mod.SpawnOptions {
         var spawn_opts = opts;
-        if (spawn_opts.stack_size == stack_mod.default_stack_size) {
-            spawn_opts.stack_size = self.config.default_stack_size;
-        }
         if (self.config.stack_guard_page) spawn_opts.guard_page = true;
         if (self.config.stack_paint_canary) spawn_opts.paint_canary = true;
+        return spawn_opts;
+    }
 
-        const pool_ptr: ?*stack_mod.Pool = if (self.pool) |*p| p else null;
-        const ex = self.executor();
-
+    fn noteSpawn(self: *Runtime) void {
         switch (self.backend) {
             .fifo => |*f| f.noteSpawn(),
             .work_stealing => |*ws| ws.noteSpawn(),
@@ -264,9 +268,31 @@ pub const Runtime = struct {
             .thread_per_task => |*t| t.noteSpawn(),
         }
         self.metrics.inc(.spawns);
-        trace.emit(.task_spawn, 0);
+    }
 
-        return task_mod.spawnOn(ex, self.allocator, pool_ptr, spawn_opts, func, args);
+    pub fn spawn(
+        self: *Runtime,
+        opts: task_mod.SpawnOptions,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) !task_mod.JoinHandle {
+        const spawn_opts = self.prepareSpawnOpts(opts);
+        self.noteSpawn();
+        trace.emit(.task_spawn, 0);
+        return task_mod.spawnOnEnv(self.spawnEnv(), spawn_opts, func, args);
+    }
+
+    pub fn spawnLeaf(
+        self: *Runtime,
+        opts: task_mod.SpawnOptions,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) !task_mod.JoinHandle {
+        var spawn_opts = self.prepareSpawnOpts(opts);
+        spawn_opts.mode = .leaf;
+        self.noteSpawn();
+        trace.emit(.task_spawn, 2);
+        return task_mod.spawnOnEnv(self.spawnEnv(), spawn_opts, func, args);
     }
 
     pub fn spawnResult(
@@ -275,26 +301,10 @@ pub const Runtime = struct {
         comptime func: anytype,
         args: std.meta.ArgsTuple(@TypeOf(func)),
     ) !task_mod.TypedJoinHandle(task_mod.ResultTypeOfPublic(func)) {
-        var spawn_opts = opts;
-        if (spawn_opts.stack_size == stack_mod.default_stack_size) {
-            spawn_opts.stack_size = self.config.default_stack_size;
-        }
-        if (self.config.stack_guard_page) spawn_opts.guard_page = true;
-        if (self.config.stack_paint_canary) spawn_opts.paint_canary = true;
-
-        const pool_ptr: ?*stack_mod.Pool = if (self.pool) |*p| p else null;
-        const ex = self.executor();
-
-        switch (self.backend) {
-            .fifo => |*f| f.noteSpawn(),
-            .work_stealing => |*ws| ws.noteSpawn(),
-            .priority => |*p| p.noteSpawn(),
-            .thread_per_task => |*t| t.noteSpawn(),
-        }
-        self.metrics.inc(.spawns);
+        const spawn_opts = self.prepareSpawnOpts(opts);
+        self.noteSpawn();
         trace.emit(.task_spawn, 1);
-
-        return task_mod.spawnOnResult(ex, self.allocator, pool_ptr, spawn_opts, func, args);
+        return task_mod.spawnOnResultEnv(self.spawnEnv(), spawn_opts, func, args);
     }
 
     pub fn run(self: *Runtime) !void {

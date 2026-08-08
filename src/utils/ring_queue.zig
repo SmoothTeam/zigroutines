@@ -35,6 +35,18 @@ pub fn RingQueue(comptime T: type) type {
             self.len += 1;
         }
 
+        pub fn pushFront(self: *Self, item: T) !void {
+            if (self.len == self.buf.len) {
+                try self.grow();
+            }
+            if (self.buf.len == 0) {
+                try self.grow();
+            }
+            self.head = if (self.head == 0) self.buf.len - 1 else self.head - 1;
+            self.buf[self.head] = item;
+            self.len += 1;
+        }
+
         pub fn pop(self: *Self) ?T {
             if (self.len == 0) return null;
             const item = self.buf[self.head];

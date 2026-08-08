@@ -463,7 +463,6 @@ pub const Reactor = struct {
     }
 };
 
-// Windows select() FFI
 const FD_SETSIZE: usize = 64;
 const SOCKET_ERROR: i32 = -1;
 
@@ -472,7 +471,6 @@ const TimeVal = extern struct {
     tv_usec: i32,
 };
 
-/// Winsock fd_set: fd_count + fixed array of SOCKET.
 const FdSet = extern struct {
     fd_count: u32 = 0,
     fd_array: [FD_SETSIZE]usize = @splat(0),

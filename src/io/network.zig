@@ -1,11 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const backend = @import("io_backend.zig");
+const task_mod = @import("../core/task.zig");
 
 const Handle = backend.Handle;
 const Backend = backend.Backend;
 const BackendError = backend.BackendError;
 const is_windows = builtin.os.tag == .windows;
+
+inline fn onWorker(comptime func: anytype, args: anytype) @TypeOf(@call(.auto, func, args)) {
+    return task_mod.callOnWorkerStack(func, args);
+}
 
 pub const NetError = BackendError || error{
     AddressInUse,
@@ -41,6 +46,10 @@ pub const TcpListener = struct {
     }
 
     pub fn bindWith(io: Backend, port: u16, opts: BindOpts) NetError!TcpListener {
+        return onWorker(bindWithImpl, .{ io, port, opts });
+    }
+
+    fn bindWithImpl(io: Backend, port: u16, opts: BindOpts) NetError!TcpListener {
         const h = try createSocket();
         errdefer closeHandle(h);
 
@@ -84,12 +93,12 @@ pub const TcpListener = struct {
     pub fn accept(self: *TcpListener) NetError!TcpStream {
         var spins: u32 = 0;
         while (true) {
-            const client = acceptOnce(self.handle) catch |err| switch (err) {
+            const client = onWorker(acceptOnce, .{self.handle}) catch |err| switch (err) {
                 error.WouldBlock => {
                     if (spins < 64) {
                         spins += 1;
-                        if (@import("../core/task.zig").current()) |_| {
-                            @import("../core/task.zig").yield();
+                        if (task_mod.current()) |_| {
+                            task_mod.yield();
                         }
                         continue;
                     }
@@ -99,7 +108,7 @@ pub const TcpListener = struct {
                 },
                 else => |e| return e,
             };
-            try setNonBlocking(client);
+            try onWorker(setNonBlocking, .{client});
             self.io.associate(client) catch {};
             return .{ .handle = client, .io = self.io };
         }
@@ -115,21 +124,27 @@ pub const TcpStream = struct {
     }
 
     pub fn connectTo(io: Backend, address: Ipv4, port: u16) NetError!TcpStream {
+        const prep = try onWorker(connectPrep, .{ address.addr, port });
+        errdefer closeHandle(prep.handle);
+        if (prep.need_wait) {
+            try io.wait(prep.handle, .write);
+            try onWorker(checkConnectError, .{prep.handle});
+        }
+        io.associate(prep.handle) catch {};
+        return .{ .handle = prep.handle, .io = io };
+    }
+
+    const ConnectPrep = struct { handle: Handle, need_wait: bool };
+
+    fn connectPrep(host_addr: u32, port: u16) NetError!ConnectPrep {
         const h = try createSocket();
         errdefer closeHandle(h);
         try setNonBlocking(h);
-
-        connectNonblockAddr(h, address.addr, port) catch |err| switch (err) {
-            error.WouldBlock => {
-                try io.wait(h, .write);
-                try checkConnectError(h);
-            },
+        connectNonblockAddr(h, host_addr, port) catch |err| switch (err) {
+            error.WouldBlock => return .{ .handle = h, .need_wait = true },
             else => |e| return e,
         };
-
-        io.associate(h) catch {};
-
-        return .{ .handle = h, .io = io };
+        return .{ .handle = h, .need_wait = false };
     }
 
     pub fn close(self: *TcpStream) void {
@@ -148,7 +163,7 @@ pub const TcpStream = struct {
 
     pub fn read(self: *TcpStream, buf: []u8) NetError!usize {
         while (true) {
-            const n = recvOnce(self.handle, buf) catch |err| switch (err) {
+            const n = onWorker(recvOnce, .{ self.handle, buf }) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.io.wait(self.handle, .read);
                     continue;
@@ -162,7 +177,7 @@ pub const TcpStream = struct {
     pub fn writeAll(self: *TcpStream, data: []const u8) NetError!void {
         var sent: usize = 0;
         while (sent < data.len) {
-            const n = sendOnce(self.handle, data[sent..]) catch |err| switch (err) {
+            const n = onWorker(sendOnce, .{ self.handle, data[sent..] }) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.io.wait(self.handle, .write);
                     continue;
@@ -357,6 +372,10 @@ pub const UdpSocket = struct {
     }
 
     pub fn bindWith(io: Backend, port: u16, opts: BindOpts) NetError!UdpSocket {
+        return onWorker(udpBindImpl, .{ io, port, opts });
+    }
+
+    fn udpBindImpl(io: Backend, port: u16, opts: BindOpts) NetError!UdpSocket {
         const h = try createUdpSocket();
         errdefer closeHandle(h);
         try setNonBlocking(h);
@@ -403,7 +422,7 @@ pub const UdpSocket = struct {
 
     pub fn recv(self: *UdpSocket, buf: []u8) NetError!usize {
         while (true) {
-            const n = recvOnce(self.handle, buf) catch |err| switch (err) {
+            const n = onWorker(recvOnce, .{ self.handle, buf }) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.io.wait(self.handle, .read);
                     continue;
@@ -416,7 +435,7 @@ pub const UdpSocket = struct {
 
     pub fn sendTo(self: *UdpSocket, data: []const u8, address: Ipv4, port: u16) NetError!usize {
         while (true) {
-            const n = sendToOnce(self.handle, data, address.addr, port) catch |err| switch (err) {
+            const n = onWorker(sendToOnce, .{ self.handle, data, address.addr, port }) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.io.wait(self.handle, .write);
                     continue;

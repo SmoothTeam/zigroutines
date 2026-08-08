@@ -97,8 +97,8 @@ pub fn main() !void {
     };
 
     S.ok = false;
-    _ = try rt.spawn(.{ .stack_size = 128 * 1024 }, S.server, .{ bio, port_ch });
-    _ = try rt.spawn(.{ .stack_size = 128 * 1024 }, S.clientTask, .{ bio, port_ch });
+    _ = try rt.spawn(.{ }, S.server, .{ bio, port_ch });
+    _ = try rt.spawn(.{ }, S.clientTask, .{ bio, port_ch });
     _ = try rt.spawn(.{}, S.watchdog, .{bio});
     try rt.run();
     std.debug.print("result ok={}\n", .{S.ok});

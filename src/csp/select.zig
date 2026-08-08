@@ -54,14 +54,102 @@ pub fn MultiResult(comptime T: type) type {
 }
 
 pub fn recv(comptime T: type, ch: *channel_mod.Channel(T), opts: Opts) RecvResult(T) {
-    const r = multi(T, .{ .recv = &.{ch} }, opts);
-    return switch (r) {
-        .recv => |x| .{ .value = x.value },
-        .closed_recv => .closed,
-        .timeout => .timeout,
-        .canceled => .canceled,
-        else => .timeout,
-    };
+    const me = task_mod.current() orelse @panic("zigroutines: select outside a task");
+    if (opts.cancel) |tok| {
+        if (tok.isCanceled()) return .canceled;
+    }
+
+    if (ch.tryRecv()) |v| {
+        return .{ .value = v };
+    } else |err| switch (err) {
+        error.Closed => return .closed,
+        error.WouldBlock, error.Full => {},
+    }
+    if (opts.timeout_ns == null and opts.cancel == null) {
+        const v = ch.recv() catch |e| switch (e) {
+            error.Closed => return .closed,
+            else => return .closed,
+        };
+        return .{ .value = v };
+    }
+
+    var waiter: channel_mod.Channel(T).RecvWaiter = .{ .task = me };
+    switch (ch.tryRecvOrRegister(&waiter)) {
+        .value => |v| return .{ .value = v },
+        .closed => return .closed,
+        .registered => {},
+    }
+
+    var timer_entry: timer_mod.TimerEntry = undefined;
+    var has_timer = false;
+    if (opts.timeout_ns) |ns| {
+        const tq = opts.timers orelse @panic("zigroutines: select timeout requires timers");
+        timer_entry = .{
+            .deadline_ns = timer_mod.nowNs() + @as(i128, @intCast(ns)),
+            .task = me,
+        };
+        tq.add(&timer_entry);
+        has_timer = true;
+    }
+
+    if (opts.cancel) |tok| {
+        tok.addWaiter(me);
+        if (tok.isCanceled()) {
+            _ = ch.unregisterRecv(&waiter);
+            if (has_timer) {
+                timer_entry.canceled = true;
+                if (opts.timers) |tq| tq.remove(&timer_entry);
+            }
+            tok.removeWaiter(me);
+            return .canceled;
+        }
+    }
+
+    const already = ch.markRecvParked(&waiter);
+    if (has_timer) {
+        if (opts.timers) |tq| {
+            tq.lock.lock();
+            if (!timer_entry.done) timer_entry.parked = true;
+            tq.lock.unlock();
+        }
+    }
+    if (!already) {
+        const ex = me.executor orelse @panic("zigroutines: select without executor");
+        ex.parkFromRunning(.chan_recv);
+    }
+
+    if (opts.cancel) |tok| {
+        tok.removeWaiter(me);
+        if (tok.isCanceled()) {
+            _ = ch.unregisterRecv(&waiter);
+            if (has_timer) {
+                timer_entry.canceled = true;
+                if (opts.timers) |tq| tq.remove(&timer_entry);
+            }
+            return .canceled;
+        }
+    }
+
+    if (waiter.done) {
+        if (has_timer) {
+            timer_entry.canceled = true;
+            if (opts.timers) |tq| tq.remove(&timer_entry);
+        }
+        if (waiter.closed) return .closed;
+        return .{ .value = waiter.value };
+    }
+
+    if (has_timer and timer_entry.done) {
+        _ = ch.unregisterRecv(&waiter);
+        return .timeout;
+    }
+
+    _ = ch.unregisterRecv(&waiter);
+    if (has_timer) {
+        timer_entry.canceled = true;
+        if (opts.timers) |tq| tq.remove(&timer_entry);
+    }
+    return .timeout;
 }
 
 pub fn recvAny(comptime T: type, channels: []const *channel_mod.Channel(T), opts: Opts) struct {
@@ -110,21 +198,41 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
         return .default;
     }
 
-    var recv_w: [max_arms]channel_mod.Channel(T).RecvWaiter = undefined;
-    var send_w: [max_arms]channel_mod.Channel(T).SendWaiter = undefined;
-    var recv_reg: [max_arms]bool = @splat(false);
-    var send_reg: [max_arms]bool = @splat(false);
+    const alloc = me.allocator;
+    const n_recv = arms.recv.len;
+    const n_send = arms.send.len;
+
+    var recv_w: []channel_mod.Channel(T).RecvWaiter = &.{};
+    var send_w: []channel_mod.Channel(T).SendWaiter = &.{};
+    var recv_reg: []bool = &.{};
+    var send_reg: []bool = &.{};
+    defer {
+        if (recv_w.len != 0) alloc.free(recv_w);
+        if (send_w.len != 0) alloc.free(send_w);
+        if (recv_reg.len != 0) alloc.free(recv_reg);
+        if (send_reg.len != 0) alloc.free(send_reg);
+    }
+    if (n_recv > 0) {
+        recv_w = alloc.alloc(channel_mod.Channel(T).RecvWaiter, n_recv) catch @panic("zigroutines: OOM select recv waiters");
+        recv_reg = alloc.alloc(bool, n_recv) catch @panic("zigroutines: OOM select recv reg");
+        @memset(recv_reg, false);
+    }
+    if (n_send > 0) {
+        send_w = alloc.alloc(channel_mod.Channel(T).SendWaiter, n_send) catch @panic("zigroutines: OOM select send waiters");
+        send_reg = alloc.alloc(bool, n_send) catch @panic("zigroutines: OOM select send reg");
+        @memset(send_reg, false);
+    }
 
     for (arms.recv, 0..) |ch, i| {
         recv_w[i] = .{ .task = me };
         switch (ch.tryRecvOrRegister(&recv_w[i])) {
             .value => |v| {
-                cleanupPartial(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, i, 0, null, opts);
+                cleanupPartial(T, arms, recv_w, send_w, recv_reg, send_reg, i, 0, null, opts);
                 trace.emit(.select_leave, 2);
                 return .{ .recv = .{ .index = i, .value = v } };
             },
             .closed => {
-                cleanupPartial(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, i, 0, null, opts);
+                cleanupPartial(T, arms, recv_w, send_w, recv_reg, send_reg, i, 0, null, opts);
                 trace.emit(.select_leave, 3);
                 return .{ .closed_recv = i };
             },
@@ -136,16 +244,16 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
         send_w[i] = .{ .task = me, .value = op.value };
         switch (op.ch.trySendOrRegister(&send_w[i])) {
             .sent => {
-                cleanupPartial(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, arms.recv.len, i, null, opts);
+                cleanupPartial(T, arms, recv_w, send_w, recv_reg, send_reg, n_recv, i, null, opts);
                 trace.emit(.select_leave, 2);
                 return .{ .send = .{ .index = i } };
             },
             .closed => {
-                cleanupPartial(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, arms.recv.len, i, null, opts);
+                cleanupPartial(T, arms, recv_w, send_w, recv_reg, send_reg, n_recv, i, null, opts);
                 return .{ .closed_send = i };
             },
             .full => {
-                cleanupPartial(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, arms.recv.len, i, null, opts);
+                cleanupPartial(T, arms, recv_w, send_w, recv_reg, send_reg, n_recv, i, null, opts);
                 return .{ .full_send = i };
             },
             .registered => send_reg[i] = true,
@@ -167,7 +275,7 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
     if (opts.cancel) |tok| {
         tok.addWaiter(me);
         if (tok.isCanceled()) {
-            cleanupAll(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, if (has_timer) &timer_entry else null, opts);
+            cleanupAll(T, arms, recv_w, send_w, recv_reg, send_reg, if (has_timer) &timer_entry else null, opts);
             return .canceled;
         }
     }
@@ -196,7 +304,7 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
     if (opts.cancel) |tok| {
         tok.removeWaiter(me);
         if (tok.isCanceled()) {
-            cleanupAll(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, if (has_timer) &timer_entry else null, opts);
+            cleanupAll(T, arms, recv_w, send_w, recv_reg, send_reg, if (has_timer) &timer_entry else null, opts);
             return .canceled;
         }
     }
@@ -206,13 +314,13 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
     var n_rr: usize = 0;
     var n_rs: usize = 0;
 
-    for (arms.recv, 0..) |_, i| {
+    for (0..n_recv) |i| {
         if (recv_reg[i] and recv_w[i].done) {
             ready_recv[n_rr] = i;
             n_rr += 1;
         }
     }
-    for (arms.send, 0..) |_, i| {
+    for (0..n_send) |i| {
         if (send_reg[i] and send_w[i].done) {
             ready_send[n_rs] = i;
             n_rs += 1;
@@ -232,7 +340,7 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
                 ready_recv[0];
             const closed = recv_w[idx].closed;
             const val = recv_w[idx].value;
-            cleanupAllExcept(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, .{ .recv = idx }, if (has_timer) &timer_entry else null, opts);
+            cleanupAllExcept(T, arms, recv_w, send_w, recv_reg, send_reg, .{ .recv = idx }, if (has_timer) &timer_entry else null, opts);
             if (closed) return .{ .closed_recv = idx };
             return .{ .recv = .{ .index = idx, .value = val } };
         } else if (n_rs > 0) {
@@ -241,18 +349,18 @@ pub fn multi(comptime T: type, arms: MultiOpts(T), opts: Opts) MultiResult(T) {
             else
                 ready_send[0];
             const closed = send_w[idx].closed;
-            cleanupAllExcept(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, .{ .send = idx }, if (has_timer) &timer_entry else null, opts);
+            cleanupAllExcept(T, arms, recv_w, send_w, recv_reg, send_reg, .{ .send = idx }, if (has_timer) &timer_entry else null, opts);
             if (closed) return .{ .closed_send = idx };
             return .{ .send = .{ .index = idx } };
         }
     }
 
     if (has_timer and timer_entry.done) {
-        cleanupAll(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, &timer_entry, opts);
+        cleanupAll(T, arms, recv_w, send_w, recv_reg, send_reg, &timer_entry, opts);
         return .timeout;
     }
 
-    cleanupAll(T, arms, &recv_w, &send_w, &recv_reg, &send_reg, if (has_timer) &timer_entry else null, opts);
+    cleanupAll(T, arms, recv_w, send_w, recv_reg, send_reg, if (has_timer) &timer_entry else null, opts);
     return .timeout;
 }
 
@@ -296,10 +404,10 @@ const Keep = union(enum) {
 fn cleanupPartial(
     comptime T: type,
     arms: MultiOpts(T),
-    recv_w: *[max_arms]channel_mod.Channel(T).RecvWaiter,
-    send_w: *[max_arms]channel_mod.Channel(T).SendWaiter,
-    recv_reg: *[max_arms]bool,
-    send_reg: *[max_arms]bool,
+    recv_w: []channel_mod.Channel(T).RecvWaiter,
+    send_w: []channel_mod.Channel(T).SendWaiter,
+    recv_reg: []bool,
+    send_reg: []bool,
     recv_end: usize,
     send_end: usize,
     timer_entry: ?*timer_mod.TimerEntry,
@@ -328,10 +436,10 @@ fn cleanupPartial(
 fn cleanupAll(
     comptime T: type,
     arms: MultiOpts(T),
-    recv_w: *[max_arms]channel_mod.Channel(T).RecvWaiter,
-    send_w: *[max_arms]channel_mod.Channel(T).SendWaiter,
-    recv_reg: *[max_arms]bool,
-    send_reg: *[max_arms]bool,
+    recv_w: []channel_mod.Channel(T).RecvWaiter,
+    send_w: []channel_mod.Channel(T).SendWaiter,
+    recv_reg: []bool,
+    send_reg: []bool,
     timer_entry: ?*timer_mod.TimerEntry,
     opts: Opts,
 ) void {
@@ -359,10 +467,10 @@ fn cleanupAll(
 fn cleanupAllExcept(
     comptime T: type,
     arms: MultiOpts(T),
-    recv_w: *[max_arms]channel_mod.Channel(T).RecvWaiter,
-    send_w: *[max_arms]channel_mod.Channel(T).SendWaiter,
-    recv_reg: *[max_arms]bool,
-    send_reg: *[max_arms]bool,
+    recv_w: []channel_mod.Channel(T).RecvWaiter,
+    send_w: []channel_mod.Channel(T).SendWaiter,
+    recv_reg: []bool,
+    send_reg: []bool,
     keep: Keep,
     timer_entry: ?*timer_mod.TimerEntry,
     opts: Opts,

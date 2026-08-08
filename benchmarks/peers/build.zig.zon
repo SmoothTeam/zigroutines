@@ -1,0 +1,20 @@
+.{
+    .name = .zigroutines_peers,
+    .version = "0.0.1",
+    .fingerprint = 0x1cd1f821cd8e1cfe,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .libxev = .{
+            .path = "deps/libxev",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "common.zig",
+        "zigcoro_bench.zig",
+        "libxev_bench.zig",
+        "zio_bench.zig",
+        "deps",
+    },
+}

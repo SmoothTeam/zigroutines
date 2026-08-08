@@ -25,7 +25,6 @@ pub fn Actor(comptime Message: type) type {
         pub const SpawnOpts = struct {
             mailbox_capacity: usize = 64,
             full_policy: channel_mod.FullPolicy = .block,
-            stack_size: usize = 64 * 1024,
             name: ?[:0]const u8 = null,
             link: ?*cancel_mod.CancelToken = null,
             on_stop: ?*const fn (*Self) void = null,
@@ -75,7 +74,7 @@ pub fn Actor(comptime Message: type) type {
             };
 
             self.handle = try runtime.spawn(
-                .{ .stack_size = opts.stack_size, .name = opts.name },
+                .{ .name = opts.name },
                 Runner.run,
                 .{self},
             );

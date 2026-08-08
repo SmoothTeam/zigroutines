@@ -23,15 +23,7 @@ pub const SpinLock = struct {
 };
 
 fn wakeTask(t: *task_mod.Task) void {
-    var spins: u32 = 0;
-    while (t.on_cpu.load(.acquire)) {
-        std.atomic.spinLoopHint();
-        spins +%= 1;
-        if (spins > 200) {
-            std.Thread.yield() catch {};
-            spins = 0;
-        }
-    }
+    task_mod.waitUntilOffCpu(t);
     if (t.state == .blocked) {
         if (t.executor) |ex| {
             ex.enqueue(t) catch {};
@@ -41,6 +33,12 @@ fn wakeTask(t: *task_mod.Task) void {
 
 fn requireTask() *task_mod.Task {
     return task_mod.current() orelse @panic("zigroutines: sync primitive outside a task");
+}
+
+fn multiWorkerRuntime() bool {
+    const runtime = @import("runtime.zig");
+    if (runtime.currentRuntime()) |rt| return rt.worker_count > 1;
+    return false;
 }
 
 const Waiter = struct {
@@ -119,12 +117,12 @@ pub const ParkingLot = struct {
 
 pub const Semaphore = struct {
     lock: SpinLock = .{},
-    count: isize,
+    count: std.atomic.Value(isize),
     waiters: list.List = .{},
 
     pub fn init(allocator: std.mem.Allocator, initial: isize) Semaphore {
         _ = allocator;
-        return .{ .count = initial };
+        return .{ .count = .init(initial) };
     }
 
     pub fn deinit(self: *Semaphore) void {
@@ -133,23 +131,51 @@ pub const Semaphore = struct {
 
     pub fn acquire(self: *Semaphore) void {
         const me = requireTask();
+        var spins: u32 = 0;
+        const max_spin: u32 = if (multiWorkerRuntime()) 64 else 0;
+        while (true) {
+            var c = self.count.load(.monotonic);
+            while (c > 0) {
+                if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic)) |cur| {
+                    c = cur;
+                } else {
+                    return;
+                }
+            }
+            if (spins < max_spin) {
+                std.atomic.spinLoopHint();
+                spins +%= 1;
+                continue;
+            }
+            break;
+        }
+
         while (true) {
             self.lock.lock();
-            if (self.count > 0) {
-                self.count -= 1;
+            var c = self.count.load(.monotonic);
+            if (c > 0) {
+                if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic) == null) {
+                    self.lock.unlock();
+                    return;
+                }
                 self.lock.unlock();
-                return;
+                continue;
             }
             var w = Waiter{ .task = me };
             self.waiters.pushBack(&w.node);
-            if (self.count > 0) {
+            c = self.count.load(.monotonic);
+            if (c > 0) {
                 self.waiters.remove(&w.node);
-                self.count -= 1;
+                if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic) == null) {
+                    self.lock.unlock();
+                    return;
+                }
                 self.lock.unlock();
-                return;
+                continue;
             }
             w.parked = true;
             self.lock.unlock();
+            if (w.done) return;
 
             const ex = me.executor orelse @panic("zigroutines: semaphore without executor");
             ex.parkFromRunning(.manual_park);
@@ -158,11 +184,13 @@ pub const Semaphore = struct {
     }
 
     pub fn tryAcquire(self: *Semaphore) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
-        if (self.count > 0) {
-            self.count -= 1;
-            return true;
+        var c = self.count.load(.monotonic);
+        while (c > 0) {
+            if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic)) |cur| {
+                c = cur;
+            } else {
+                return true;
+            }
         }
         return false;
     }
@@ -178,34 +206,191 @@ pub const Semaphore = struct {
             if (parked) wakeTask(t);
             return;
         }
-        self.count += 1;
+        _ = self.count.fetchAdd(1, .release);
         self.lock.unlock();
     }
 };
 
 pub const Mutex = struct {
-    sem: Semaphore,
+    state: std.atomic.Value(u8) = .init(0),
+    wait_lock: SpinLock = .{},
+    waiters: list.List = .{},
+
+    const unlocked: u8 = 0;
+    const locked: u8 = 1;
+    const contested: u8 = 2;
 
     pub fn init(allocator: std.mem.Allocator) Mutex {
-        return .{ .sem = Semaphore.init(allocator, 1) };
+        _ = allocator;
+        return .{};
     }
 
     pub fn deinit(self: *Mutex) void {
-        self.sem.deinit();
-    }
-
-    pub fn lock(self: *Mutex) void {
-        self.sem.acquire();
+        self.* = undefined;
     }
 
     pub fn tryLock(self: *Mutex) bool {
-        return self.sem.tryAcquire();
+        return self.state.cmpxchgStrong(unlocked, locked, .acquire, .monotonic) == null;
+    }
+
+    pub fn lock(self: *Mutex) void {
+        if (self.tryLock()) return;
+
+        const max_spin: u32 = if (multiWorkerRuntime()) 100 else 0;
+        var spins: u32 = 0;
+        while (spins < max_spin) : (spins += 1) {
+            if (self.state.load(.monotonic) == unlocked) {
+                if (self.tryLock()) return;
+            }
+            std.atomic.spinLoopHint();
+        }
+
+        const me = requireTask();
+        while (true) {
+            self.wait_lock.lock();
+            const prev = self.state.swap(contested, .acquire);
+            if (prev == unlocked) {
+                self.state.store(locked, .release);
+                self.wait_lock.unlock();
+                return;
+            }
+            var w = Waiter{ .task = me };
+            self.waiters.pushBack(&w.node);
+            w.parked = true;
+            self.wait_lock.unlock();
+
+            if (w.done) return;
+
+            const ex = me.executor orelse @panic("zigroutines: mutex without executor");
+            ex.parkFromRunning(.manual_park);
+            if (w.done) return;
+        }
     }
 
     pub fn unlock(self: *Mutex) void {
-        self.sem.release();
+        if (self.state.cmpxchgStrong(locked, unlocked, .release, .monotonic) == null) return;
+
+        self.wait_lock.lock();
+        if (self.waiters.popFront()) |node| {
+            const w: *Waiter = @fieldParentPtr("node", node);
+            w.done = true;
+            const parked = w.parked;
+            const t = w.task;
+            if (self.waiters.isEmpty()) {
+                self.state.store(locked, .release);
+            } else {
+                self.state.store(contested, .release);
+            }
+            self.wait_lock.unlock();
+            if (parked) wakeTask(t);
+            return;
+        }
+        self.state.store(unlocked, .release);
+        self.wait_lock.unlock();
     }
 };
+
+pub const Notify = struct {
+    lot: ParkingLot = .{},
+
+    pub fn init(allocator: std.mem.Allocator) Notify {
+        _ = allocator;
+        return .{};
+    }
+
+    pub fn deinit(self: *Notify) void {
+        self.* = undefined;
+    }
+
+    pub fn wait(self: *Notify) void {
+        self.lot.park();
+    }
+
+    pub fn notifyOne(self: *Notify) void {
+        self.lot.wakeOne();
+    }
+
+    pub fn notifyAll(self: *Notify) void {
+        self.lot.wakeAll();
+    }
+};
+
+pub fn Watch(comptime T: type) type {
+    return struct {
+        lock: SpinLock = .{},
+        value: T = undefined,
+        version: u64 = 0,
+        has_value: bool = false,
+        waiters: list.List = .{},
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            _ = allocator;
+            return .{};
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.* = undefined;
+        }
+
+        pub fn send(self: *Self, v: T) void {
+            self.lock.lock();
+            self.value = v;
+            self.has_value = true;
+            self.version +%= 1;
+            var batch: [32]*Waiter = undefined;
+            var n: usize = 0;
+            while (self.waiters.popFront()) |node| {
+                const w: *Waiter = @fieldParentPtr("node", node);
+                if (n < batch.len) {
+                    batch[n] = w;
+                    n += 1;
+                } else {
+                    w.done = true;
+                    const parked = w.parked;
+                    const t = w.task;
+                    self.lock.unlock();
+                    if (parked) wakeTask(t);
+                    self.lock.lock();
+                }
+            }
+            self.lock.unlock();
+            for (batch[0..n]) |w| {
+                w.done = true;
+                if (w.parked) wakeTask(w.task);
+            }
+        }
+
+        pub fn recv(self: *Self, seen: u64) struct { T, u64 } {
+            const me = requireTask();
+            while (true) {
+                self.lock.lock();
+                if (self.has_value and self.version != seen) {
+                    const v = self.value;
+                    const ver = self.version;
+                    self.lock.unlock();
+                    return .{ v, ver };
+                }
+                var w = Waiter{ .task = me };
+                self.waiters.pushBack(&w.node);
+                w.parked = true;
+                self.lock.unlock();
+                const ex = me.executor orelse @panic("zigroutines: watch without executor");
+                ex.parkFromRunning(.manual_park);
+            }
+        }
+
+        pub fn tryRecv(self: *Self, seen: u64) ?struct { T, u64 } {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.has_value and self.version != seen) {
+                return .{ self.value, self.version };
+            }
+            return null;
+        }
+    };
+}
 
 pub const RwLock = struct {
     lock: SpinLock = .{},

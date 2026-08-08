@@ -14,7 +14,6 @@ pub const supported = is_linux or is_macos or is_freebsd;
 
 pub const Entry = *const fn (arg: *anyopaque) callconv(.c) void;
 
-/// Layout: x19..x28 (10), fp, lr, sp  → 13 × usize
 pub const Context = extern struct {
     x19: usize = 0,
     x20: usize = 0,
@@ -26,8 +25,8 @@ pub const Context = extern struct {
     x26: usize = 0,
     x27: usize = 0,
     x28: usize = 0,
-    fp: usize = 0, // x29
-    lr: usize = 0, // x30 — resume address
+    fp: usize = 0,
+    lr: usize = 0,
     sp: usize = 0,
 };
 
@@ -40,30 +39,24 @@ fn fiberReturned() callconv(.c) noreturn {
 }
 
 pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
-    if (stack.len < 4096) {
-        @panic("zigroutines: stack too small (need at least 4KiB)");
+    if (stack.len < 2048) {
+        @panic("zigroutines: stack too small (need at least 2KiB)");
     }
 
     var top: usize = @intFromPtr(stack.ptr) + stack.len;
-    // AAPCS64: SP 16-byte aligned
     top &= ~@as(usize, 15);
-
-    // Fake return address
     top -= 8;
     @as(*usize, @ptrFromInt(top)).* = @intFromPtr(&fiberReturned);
-    // Align again after push
     top &= ~@as(usize, 15);
 
     ctx.* = .{};
     ctx.lr = @intFromPtr(&wrapMain);
     ctx.sp = top;
-    // Pass entry/arg in callee-saved regs
     ctx.x19 = @intFromPtr(entry);
     ctx.x20 = @intFromPtr(arg);
 }
 
 fn wrapMain() callconv(.naked) void {
-    // AAPCS64: first arg in x0
     asm volatile (
         \\ mov x0, x20
         \\ br x19
@@ -71,7 +64,6 @@ fn wrapMain() callconv(.naked) void {
 }
 
 pub fn swap(from: *Context, to: *Context) void {
-    // AAPCS64: from=x0, to=x1
     asm volatile (
         \\ // save
         \\ str x19, [x0, #0]

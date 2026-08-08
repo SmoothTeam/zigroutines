@@ -90,6 +90,24 @@ pub const FifoScheduler = struct {
             }
 
             if (self.ready.pop()) |next| {
+                if (next.isLeaf()) {
+                    self.running = next;
+                    next.scheduled.store(false, .release);
+                    next.state = .running;
+                    next.on_cpu.store(true, .release);
+                    task_mod.setCurrent(next);
+                    task_mod.runLeafOnWorker(next);
+                    task_mod.setCurrent(null);
+                    next.on_cpu.store(false, .release);
+                    next.state = .dead;
+                    next.finished.store(true, .release);
+                    next.finishJoiners();
+                    if (self.live > 0) self.live -= 1;
+                    if (self.metrics) |m| m.inc(.finishes);
+                    next.destroy();
+                    self.running = null;
+                    continue;
+                }
                 self.running = next;
                 next.scheduled.store(false, .release);
                 next.state = .running;
@@ -97,8 +115,16 @@ pub const FifoScheduler = struct {
                 task_mod.setCurrent(next);
                 context.swap(&self.sched_ctx, &next.ctx);
                 task_mod.setCurrent(null);
-                next.on_cpu.store(false, .release);
-                self.running = null;
+                if (self.running) |r| {
+                    r.on_cpu.store(false, .release);
+                    self.running = null;
+                    if (task_mod.takeBounceAndRun(r)) {
+                        self.enqueue(r) catch @panic("zigroutines: OOM requeue after bounce");
+                    }
+                } else if (task_mod.takeBounceAndRun(next)) {
+                    self.enqueue(next) catch @panic("zigroutines: OOM requeue after bounce");
+                }
+                self.collectFinishedVoid();
                 continue;
             }
 
@@ -130,11 +156,10 @@ pub const FifoScheduler = struct {
 
             if (self.timers) |tq| {
                 if (tq.nextDeadlineNs()) |deadline| {
-                    var guard: u32 = 0;
                     while (timer_mod.nowNs() < deadline and self.ready.isEmpty()) {
-                        std.Thread.yield() catch {};
-                        guard +%= 1;
-                        if (guard > 10_000_000) break;
+                        timer_mod.sleepUntilDeadline(deadline);
+                        _ = tq.fireExpired();
+                        if (!self.ready.isEmpty()) break;
                     }
                     _ = tq.fireExpired();
                     if (!self.ready.isEmpty() or tq.nextDeadlineNs() != null) continue;
@@ -150,19 +175,42 @@ pub const FifoScheduler = struct {
 
     pub fn yieldFromRunning(self: *FifoScheduler) void {
         const t = self.running orelse @panic("zigroutines: yield with no running task");
+        if (self.metrics) |m| m.inc(.yields);
+
         t.state = .ready;
         t.scheduled.store(true, .release);
         self.ready.push(t) catch @panic("zigroutines: OOM on yield enqueue");
-        if (self.metrics) |m| m.inc(.yields);
+        if (self.ready.peek()) |cand| {
+            if (cand != t and !cand.isLeaf()) {
+                const next = self.ready.pop().?;
+                std.debug.assert(next == cand);
+                self.running = next;
+                next.scheduled.store(false, .release);
+                next.state = .running;
+                next.on_cpu.store(true, .release);
+                task_mod.setCurrent(next);
+                t.on_cpu.store(false, .release);
+                context.swap(&t.ctx, &next.ctx);
+                self.running = t;
+                t.on_cpu.store(true, .release);
+                task_mod.setCurrent(t);
+                return;
+            }
+        }
+        self.running = null;
+        t.on_cpu.store(false, .release);
         context.swap(&t.ctx, &self.sched_ctx);
     }
 
     pub fn parkFromRunning(self: *FifoScheduler, reason: task_mod.WaitReason) void {
         const t = self.running orelse @panic("zigroutines: park with no running task");
+        task_mod.requireStackfulForPark();
         t.state = .blocked;
         t.blocked_on = reason;
         t.scheduled.store(false, .release);
         if (self.metrics) |m| m.inc(.parks);
+        self.running = null;
+        t.on_cpu.store(false, .release);
         context.swap(&t.ctx, &self.sched_ctx);
     }
 
@@ -175,6 +223,8 @@ pub const FifoScheduler = struct {
         if (self.metrics) |m| m.inc(.finishes);
         const t_ctx = &t.ctx;
         self.dead.append(self.allocator, t) catch @panic("zigroutines: OOM finishing task");
+        self.running = null;
+        t.on_cpu.store(false, .release);
         context.swap(t_ctx, &self.sched_ctx);
     }
 
@@ -182,6 +232,23 @@ pub const FifoScheduler = struct {
         while (self.dead.items.len > 0) {
             const t = self.dead.pop().?;
             t.destroy();
+        }
+    }
+
+    pub fn collectFinishedVoid(self: *FifoScheduler) void {
+        var i: usize = 0;
+        while (i < self.dead.items.len) {
+            const t = self.dead.items[i];
+            if (t.recycled) {
+                _ = self.dead.orderedRemove(i);
+                continue;
+            }
+            if (t.result_slot == null) {
+                _ = self.dead.orderedRemove(i);
+                t.destroy();
+            } else {
+                i += 1;
+            }
         }
     }
 };

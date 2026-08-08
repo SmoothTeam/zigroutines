@@ -70,6 +70,8 @@ pub const trace = tracing;
 pub const c_api = c_bindings;
 
 pub const Task = task.Task;
+pub const TaskMode = task.TaskMode;
+pub const TaskCache = task.TaskCache;
 pub const Runtime = runtime.Runtime;
 pub const Config = runtime.Config;
 pub const SchedulerPolicy = runtime.SchedulerPolicy;
@@ -105,6 +107,8 @@ pub const Mutex = synchronization.Mutex;
 pub const RwLock = synchronization.RwLock;
 pub const RateLimiter = synchronization.RateLimiter;
 pub const ParkingLot = synchronization.ParkingLot;
+pub const Notify = synchronization.Notify;
+pub const Watch = synchronization.Watch;
 pub const Actor = actors.Actor;
 
 pub const yield = task.yield;

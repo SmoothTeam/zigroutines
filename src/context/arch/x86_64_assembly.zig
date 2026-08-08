@@ -54,8 +54,8 @@ fn fiberReturned() callconv(.c) noreturn {
 }
 
 pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
-    if (stack.len < 4096) {
-        @panic("zigroutines: stack too small (need at least 4KiB)");
+    if (stack.len < 2048) {
+        @panic("zigroutines: stack too small (need at least 2KiB)");
     }
 
     var top: usize = @intFromPtr(stack.ptr) + stack.len;
@@ -64,7 +64,7 @@ pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
     if (comptime is_windows) {
         top -= 32;
     } else {
-        top -= 128;
+        top -= 16;
     }
 
     top -= 8;
@@ -89,13 +89,11 @@ pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
 
 fn wrapMain() callconv(.naked) void {
     if (comptime is_windows) {
-        // Windows: first arg in RCX
         asm volatile (
             \\ movq %%r13, %%rcx
             \\ jmpq *%%r12
         );
     } else {
-        // System V: first arg in RDI
         asm volatile (
             \\ movq %%r13, %%rdi
             \\ jmpq *%%r12
@@ -172,7 +170,6 @@ fn swapWindows(from: *Context, to: *Context) callconv(.c) void {
         \\ movups %%xmm13, 192(%[from])
         \\ movups %%xmm14, 208(%[from])
         \\ movups %%xmm15, 224(%[from])
-        // TEB (GS:[0x30]) stack bookkeeping
         \\ movq %%gs:0x30, %%r10
         \\ movq 0x20(%%r10), %%rax
         \\ movq %%rax, 240(%[from])
@@ -182,7 +179,6 @@ fn swapWindows(from: *Context, to: *Context) callconv(.c) void {
         \\ movq %%rax, 256(%[from])
         \\ movq 0x08(%%r10), %%rax
         \\ movq %%rax, 264(%[from])
-        // Restore TEB from `to` (r11)
         \\ movq 264(%%r11), %%rax
         \\ movq %%rax, 0x08(%%r10)
         \\ movq 256(%%r11), %%rax
@@ -191,7 +187,6 @@ fn swapWindows(from: *Context, to: *Context) callconv(.c) void {
         \\ movq %%rax, 0x1478(%%r10)
         \\ movq 240(%%r11), %%rax
         \\ movq %%rax, 0x20(%%r10)
-        // Restore XMM + GPRs from `to` (r11)
         \\ movups 224(%%r11), %%xmm15
         \\ movups 208(%%r11), %%xmm14
         \\ movups 192(%%r11), %%xmm13
@@ -275,11 +270,11 @@ test "context swap ping-pong" {
     try std.testing.expect(isInitialized(&pair.fiber));
     try std.testing.expectEqual(@as(usize, 0), pair.hits);
 
-    swap(&pair.main, &pair.fiber); // hit 1
+    swap(&pair.main, &pair.fiber);
     try std.testing.expectEqual(@as(usize, 1), pair.hits);
-    swap(&pair.main, &pair.fiber); // hit 2
+    swap(&pair.main, &pair.fiber);
     try std.testing.expectEqual(@as(usize, 2), pair.hits);
-    swap(&pair.main, &pair.fiber); // hit 3
+    swap(&pair.main, &pair.fiber);
     try std.testing.expectEqual(@as(usize, 3), pair.hits);
 }
 

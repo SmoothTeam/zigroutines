@@ -17,8 +17,11 @@ pub const FullPolicy = enum {
     error_full,
 };
 
+pub const default_channel_recycle: bool = false;
+
 pub const ChannelOptions = struct {
     full_policy: FullPolicy = .block,
+    recycle: bool = default_channel_recycle,
 };
 
 pub fn Channel(comptime T: type) type {
@@ -37,9 +40,29 @@ pub fn Channel(comptime T: type) type {
         recv_q: list.List = .{},
 
         dropped: u64 = 0,
+        pool_next: ?*Self = null,
+        may_recycle: bool = false,
 
         const Self = @This();
         pub const Elem = T;
+
+        const pool_caps = [_]usize{ 0, 1, 8, 16, 256 };
+        const max_pooled_per_class: usize = 2048;
+
+        var pool_lock: sync.SpinLock = .{};
+        var free_heads: [pool_caps.len]?*Self = @splat(null);
+        var free_counts: [pool_caps.len]usize = @splat(0);
+
+        fn poolClass(capacity: usize) ?usize {
+            inline for (pool_caps, 0..) |c, i| {
+                if (c == capacity) return i;
+            }
+            return null;
+        }
+
+        fn wantRecycle(opts: ChannelOptions) bool {
+            return opts.recycle;
+        }
 
         pub const SendWaiter = struct {
             node: list.Node = .{},
@@ -63,7 +86,40 @@ pub fn Channel(comptime T: type) type {
             return createWith(allocator, capacity, .{});
         }
 
+        pub fn createPooled(allocator: std.mem.Allocator, capacity: usize) !*Self {
+            return createWith(allocator, capacity, .{ .recycle = true });
+        }
+
         pub fn createWith(allocator: std.mem.Allocator, capacity: usize, opts: ChannelOptions) !*Self {
+            const recycle = wantRecycle(opts);
+            if (recycle) {
+                if (poolClass(capacity)) |idx| {
+                    pool_lock.lock();
+                    if (free_heads[idx]) |head| {
+                        free_heads[idx] = head.pool_next;
+                        free_counts[idx] -= 1;
+                        pool_lock.unlock();
+                        const kept_buf = head.buf;
+                        head.* = .{
+                            .allocator = allocator,
+                            .capacity = capacity,
+                            .full_policy = opts.full_policy,
+                            .buf = kept_buf,
+                            .head = 0,
+                            .len = 0,
+                            .closed = false,
+                            .send_q = .{},
+                            .recv_q = .{},
+                            .dropped = 0,
+                            .pool_next = null,
+                            .may_recycle = true,
+                        };
+                        return head;
+                    }
+                    pool_lock.unlock();
+                }
+            }
+
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
@@ -77,6 +133,7 @@ pub fn Channel(comptime T: type) type {
                 .capacity = capacity,
                 .full_policy = opts.full_policy,
                 .buf = buf,
+                .may_recycle = recycle and poolClass(capacity) != null,
             };
             return self;
         }
@@ -85,6 +142,28 @@ pub fn Channel(comptime T: type) type {
             self.close();
             std.debug.assert(self.send_q.isEmpty());
             std.debug.assert(self.recv_q.isEmpty());
+
+            if (self.may_recycle) {
+                if (poolClass(self.capacity)) |idx| {
+                    pool_lock.lock();
+                    if (free_counts[idx] < max_pooled_per_class) {
+                        self.head = 0;
+                        self.len = 0;
+                        self.closed = false;
+                        self.dropped = 0;
+                        self.send_q = .{};
+                        self.recv_q = .{};
+                        self.full_policy = .block;
+                        self.pool_next = free_heads[idx];
+                        free_heads[idx] = self;
+                        free_counts[idx] += 1;
+                        pool_lock.unlock();
+                        return;
+                    }
+                    pool_lock.unlock();
+                }
+            }
+
             if (self.buf.len != 0) {
                 self.allocator.free(self.buf);
             }

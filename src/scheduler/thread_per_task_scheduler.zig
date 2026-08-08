@@ -174,16 +174,21 @@ pub const ThreadPerTaskScheduler = struct {
         t.state = .ready;
         if (self.metrics) |m| m.inc(.yields);
         const slot = tls_slot orelse @panic("zigroutines: 1:1 yield without slot");
+        t.on_cpu.store(false, .release);
         context.swap(&t.ctx, &slot.sched_ctx);
+        t.on_cpu.store(true, .release);
     }
 
     pub fn parkFromRunning(self: *ThreadPerTaskScheduler, reason: task_mod.WaitReason) void {
         const t = task_mod.current() orelse @panic("zigroutines: park with no task");
+        task_mod.requireStackfulForPark();
         t.state = .blocked;
         t.blocked_on = reason;
         if (self.metrics) |m| m.inc(.parks);
         const slot = tls_slot orelse @panic("zigroutines: 1:1 park without slot");
+        t.on_cpu.store(false, .release);
         context.swap(&t.ctx, &slot.sched_ctx);
+        t.on_cpu.store(true, .release);
     }
 
     pub fn finishFromRunning(self: *ThreadPerTaskScheduler) void {
@@ -198,7 +203,10 @@ pub const ThreadPerTaskScheduler = struct {
         self.dead.append(self.allocator, t) catch {};
         self.lock.unlock();
         const slot = tls_slot orelse @panic("zigroutines: 1:1 finish without slot");
+        t.on_cpu.store(false, .release);
+        task_mod.setCurrent(null);
         context.swap(&t.ctx, &slot.sched_ctx);
+        @panic("zigroutines: resumed dead task");
     }
 
     pub fn collectUnjoined(self: *ThreadPerTaskScheduler) void {

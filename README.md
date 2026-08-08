@@ -2,10 +2,11 @@
 
 zigroutines — explicit **stackful M:N** concurrency for Zig: Go-shaped tasks, channels, and `select`, with a Runtime you construct yourself.
 
+
 | | |
 |--|--|
 | **Version** | **1.0.0** (`build.zig.zon` · `zr.version`) |
-| **License** | **MIT** ([LICENSE](LICENSE)) |
+| **License** | **LGPL-3.0-or-later** ([LICENSE](LICENSE)) |
 | **Platforms** | **x86_64 / aarch64** · Windows, Linux, macOS, FreeBSD |
 | **Zig** | **0.16** and **0.17-dev** |
 
@@ -25,25 +26,26 @@ zig build example -Dexample=01_minimal_spawn
 
 **zigroutines** is a library for **explicit stackful concurrency** in Zig. It gives you a Go-shaped model (tasks, channels, `select`, cancellation, timers) with Zig’s philosophy: **nothing global, nothing hidden, pay only for what you enable**.
 
-Unlike a “runtime baked into the language,” **you construct** a `Runtime`, choose the scheduler policy, stack size, I/O backend, and metrics. No GC. No automatic stack growth. No netpoller until you plug one in.
+Unlike a “runtime baked into the language,” **you construct** a `Runtime`, choose the scheduler policy, I/O backend, and metrics. Stacks are **fixed 2 KiB** (no growth, no per-task dial). No GC. No netpoller until you plug one in.
 
 At a glance:
 
 | Property | Value |
 |----------|--------|
-| Model | M:N **stackful** tasks (fibers) on **fixed-size** stacks |
+| Model | M:N **stackful** tasks on **fixed 2 KiB** stacks (no growth, no per-task size choice) + opt-in **leaf** (stackless run-to-completion) |
 | Schedulers | FIFO · work-stealing · priority · 1 OS thread per task |
 | CSP | `Channel(T)`, rendezvous / buffered, multi-arm `select` (up to 32 arms per kind) |
 | Cancellation | Cooperative, hierarchical `CancelToken`, `Scope` / `Nursery` |
 | I/O | Plugin: `none` / `poll` / `iocp` / `io_uring` |
-| Synchronization | Mutex, Semaphore, RwLock, RateLimiter — park the **task**, not the OS thread |
-| Cost | Pay-for-what-you-use; hot paths avoid extra heap traffic |
+| Synchronization | Mutex (adaptive), Semaphore, RwLock, RateLimiter, **Notify**, **Watch(T)** — park the **task**, not the OS thread |
+| Timers | Hierarchical **wheel** (256×1 ms) + heap overflow |
+| Cost | Pay-for-what-you-use; stack pool + task freelist on; channel `createPooled` for hot create |
 
 ### 1.2. What it gives Zig developers
 
 1. **Write top-down “sync-looking” code** — `send` / `recv` / `sleep` / `yield` look like ordinary calls; under the hood the task parks and yields the CPU to other fibers. No function coloring (`async`/`await` does not infect the call tree).
 
-2. **Predictable resources** — fixed-size stacks (default 64 KiB). RSS ≈ size × live tasks. Optional pool, guard page, and canary for diagnostics.
+2. **Predictable resources** — every fiber has a **fixed 2 KiB** stack (no size dial). Heavy buffers go on the heap. Stack pool on by default. Optional guard page / canary.
 
 3. **Swap scheduling policy without changing the API** — the same `spawn` works on FIFO (1 worker), work-stealing (many cores), priority, and thread-per-task.
 
@@ -71,7 +73,6 @@ At a glance:
 | Structured cancel / nursery | No | Limited | **Scope + Nursery** |
 | Quiet netpoller by default | You wire it | Often coupled to the runtime | **Off until you configure it** |
 
-**Takeaway:** use **libxev** for a pure completion loop. Use **zigcoro/zio** if you only need fibers. Use **zigroutines** when you want Go-shaped coordination (channels, select, cancel) **and** Zig-shaped control (explicit Runtime, fixed stacks, pluggable I/O/scheduler) in one package.
 
 #### Versus Go, C++, Rust
 
@@ -149,14 +150,6 @@ defer rt.deinit();
 _ = try rt.spawn(.{}, myFn, .{});
 try rt.run();
 ```
-
-#### Requirements
-
-- **zigroutines 1.0.0**
-- Zig **0.16** or **0.17-dev** (see `minimum_zig_version` in `build.zig.zon` for the CI/dev pin)
-- Architectures with context-switch support: **x86_64**, **aarch64**
-- OS: Windows, Linux, macOS, FreeBSD
-
 ---
 
 ## 2. Architecture
@@ -176,7 +169,7 @@ try rt.run();
        │                                             │
        ▼                                             ▼
   ┌──────────────────────────────────────────────────────────┐
-  │  Runtime  (you construct it — not process-global)        │
+  │  Runtime  (you construct it - not process-global)        │
   │  scheduler · timers · metrics · cancel · I/O backend     │
   └──────────────┬───────────────────────────┬───────────────┘
                  │                           │
@@ -187,7 +180,7 @@ try rt.run();
                        + pool
 ```
 
-**Defaults (pay nothing extra):** 1 worker · FIFO · 64 KiB fixed stack · I/O off · metrics off · preemption off.
+**Defaults:** 1 worker · FIFO · **fixed 2 KiB** stacks · stack pool on · task freelist on · I/O off · metrics off · preemption off. (Channel recycle is opt-in via `createPooled` so test allocators stay leak-free.)
 
 ### 2.2. Layers and control flow
 
@@ -227,7 +220,6 @@ Below is a full catalog of “what exists in the system” and **where the code 
 | **thread_per_task** | 1 OS thread per task (1:1), for comparison / blocking FFI | `src/scheduler/thread_per_task_scheduler.zig` |
 | Shared facade | | `src/scheduler/scheduler.zig` |
 
-**Work-stealing algorithm:** each worker has a Chase-Lev deque; when the local queue is empty it steals from others. Metric `steals` (if metrics on).
 
 #### 2.3.3. Stacks
 
@@ -238,7 +230,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 | **guard_page** | PROT_NONE / PAGE_NOACCESS under the stack → fault on overflow | `stack.zig` |
 | **paint_canary** | Pattern fill; `highWaterUsed()` | `stack.zig` |
 
-**Rule:** the stack **does not grow**. Overflow is either a guard-page fault or silent memory corruption without a guard. Size is set via `Config.default_stack_size` / `SpawnOptions.stack_size`.
+**Rule:** the stack **does not grow** and **is not sized per task** — every stackful fiber is **`fiber_stack_size` (2 KiB)**. Overflow is a guard-page fault (if enabled) or silent corruption. Keep deep frames and large buffers on the heap; use `spawnLeaf` for run-to-completion work with no private stack.
 
 #### 2.3.4. Context switch
 
@@ -274,7 +266,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 
 | Entity | Role | Files |
 |--------|------|--------|
-| **TimerQueue** | Min-heap by deadline; `sleep`, `fireExpired` | `src/core/timer_queue.zig` |
+| **TimerQueue** | Near-term **wheel** (256×1 ms) + min-heap for long deadlines; `sleep`, `fireExpired` | `src/core/timer_queue.zig` |
 | Integration | Scheduler in idle fires expired timers | `fifo_scheduler.zig`, `work_stealing_scheduler.zig`, … |
 
 #### 2.3.8. Synchronization (task-aware)
@@ -283,11 +275,13 @@ Below is a full catalog of “what exists in the system” and **where the code 
 |-----------|----------|--------|
 | **SpinLock** | Short spin + OS yield | `src/core/synchronization.zig` |
 | **ParkingLot** | Park/wake a waiter list | `synchronization.zig` |
-| **Semaphore / Mutex** | Counter / binary; park fiber | `synchronization.zig` |
+| **Semaphore / Mutex** | Atomic/CAS uncontended; multi-worker short spin; else park | `synchronization.zig` |
 | **RwLock** | Shared/exclusive; writer preference | `synchronization.zig` |
 | **RateLimiter** | Token bucket; sleep + wake waiters | `synchronization.zig` |
+| **Notify** | One/all wake of parked tasks | `synchronization.zig` |
+| **Watch(T)** | Broadcast latest value + version | `synchronization.zig` |
 
-**Invariant:** blocking **does not hold an OS worker in a useless wait** (except spin on very short critical sections). The waiter is removed from the ready queue.
+**Invariant:** blocking **does not hold an OS worker in a useless wait** (except a short multi-worker spin). Single-worker runtimes never spin on mutex/sem (would starve the holder).
 
 #### 2.3.9. I/O
 
@@ -500,52 +494,82 @@ Intentionally weaker (future hardening):
 
 ## 5. Benchmarks
 
-```bash
-zig build bench -Doptimize=ReleaseFast
-```
+| Peer | Product | Measured in harness |
+|------|---------|---------------------|
+| **zigcoro** | thin stackful fibers + executor Channel | bounce, `n_tasks_1k/10k`, chan pipeline / cap-1 |
+| **libxev** | event loop (not fibers) | timer 100k, async notify, TCP/UDP ping |
+| **zio** | Runtime + Channel + sync | yield, spawn, nursery≈Group, channels, mutex/sem/rwlock excl, sleep |
 
-Code: `benchmarks/bench_main.zig`. Covers yield (ping-pong / single / work-stealing×4), spawn_join, spawn_result_join, channel (pipeline / rendezvous / mpmc / try), select fan-in, mutex, semaphore, priority dispatch, nursery join, timer batch, actor mailbox.
 
-### 5.1. Results (measured on one machine)
+### 5.1. Full comparison tables
 
-**Environment:** Windows x86_64 · Zig `0.17.0-dev` `-Doptimize=ReleaseFast` · Go `1.26` · g++ C++17 `-O3 -pthread` · 12 logical CPUs.
+**Host:** Windows x86_64 · 12 CPUs
 
-**What was compared (one-shot, outside the repo):**
+#### Fiber / spawn
 
-| | **zigroutines** | **Go** | **C++** |
-|--|-----------------|--------|---------|
-| Model | M:N fibers, fixed stack | goroutines + channels | OS threads + mutex/cv “channels” |
-| Code in repo | `benchmarks/bench_main.zig` | reference run, not shipped | reference run, not shipped |
+| Workload | **zigroutines** | **Go** | **Rust/Tokio** | **C++** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|-------:|---------------:|--------:|------------:|-----------:|--------:|
+| `ctx_switch_bounce` | **4.5 ns** | n/a | n/a | n/a | 16.4 ns | n/a   | n/a   |
+| `yield_pingpong` | **6.7 ns** | 97.2 ns | 357 ns | 45.9 ns | n/a   | n/a   | 8.9 ns |
+| `yield_single` | 49 ns  | 175 ns | **32 ns** | 99 ns | n/a   | n/a   | **4.9 ns** |
+| `yield_ws_4w` | 127 ns | 234 ns | 177 ns | **66 ns** | n/a   | n/a   | n/a   |
+| `leaf_spawn_batch` | 300 ns | n/a | n/a | n/a | n/a   | n/a   | **170 ns** |
+| `spawn_join` | **209 ns** | 800 ns | 1678 ns | ~97k | n/a   | n/a   | 620 ns |
+| `spawn_result_join` | 15k ns | **800 ns** | 1459 ns | ~94k | n/a   | n/a   | n/a   |
+| `nursery_join` | 864 ns | 1500 ns | **685 ns** | ~46k | n/a   | n/a   | 184 ns (Group) |
+| `priority_dispatch` | **188 ns** | 400 ns | 805 ns | ~96k | n/a   | n/a   | n/a   |
+| `skynet_join_10k` | 14k ns | **900 ns** | 43k | 48k | n/a   | n/a   | n/a   |
+| `n_tasks_1000` | **30 ns** | 300 ns | 74 ns | 2224 | 28 ns | n/a   | 41 ns |
+| `n_tasks_10000` | 69 ns | 400 ns | 71 ns | 2215 | 104 ns | n/a   | **36 ns** |
+| `n_tasks_50000` | 97 ns | 477 ns | **67 ns** | n/a | skipped | n/a   | skipped |
+| density / stack | **2 KiB** fixed | growable | stackless | OS thr | 4 KiB default | n/a | growable |
 
-Numbers are **ns/op** (lower is better). A dash means that workload had no direct analog in that reference.
 
-| Workload | **zigroutines** | **Go** | **C++ (threads)** |
-|----------|----------------:|-------:|------------------:|
-| `yield_pingpong` | **27.5** | 113.4 | 164.4 |
-| `yield_single` | **49.6** | 145.5 | 113.8 |
-| `yield_ws_4w` | 124.5 | 301.8 | **42.6** |
-| `spawn_join` | 3711 | **949** | 105240 |
-| `chan_pipeline_buf256` | **25.4** | 79.7 | 180.8 |
-| `chan_rendezvous` | **114** | 339 | 211 |
-| `chan_mpmc_4x4` | 188 | **100** | 301 |
-| `chan_try_uncontended` | **25.8** | 51.8 | 40.0 |
-| `select_fanin_2` | **38.2** | 219 | — |
-| `mutex_uncontended` | 22.1 | **14.9** | 17.3 |
-| `mutex_contended_4` | 651 | 39.9 | **33.5** |
-| `sem_handoff` | **20.1** | 299 | 8505 |
-| `nursery_join` | 3358 | **498** | 58339 |
-| `timer_sleep_batch` | 6598 | **1392** | 48462 |
-| `actor_mailbox` | **20.2** | 75.9 | 180 |
-| `spawn_result_join` | 4877 | — | — |
-| `priority_dispatch` | 882 | — | — |
+#### Channel / actor
 
-### 5.2. How to read the table
+| Workload | **zigroutines** | **Go** | **Rust** | **C++** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|-------:|---------:|--------:|------------:|-----------:|--------:|
+| `chan_pipeline_buf256` | **16 ns** | 67.7 | 167 | 195 | ~3 ns (executor Chan) | n/a   | 36.7 ns |
+| `chan_rendezvous` | **86 ns** | 340 | 508 | 24k | 68 ns (cap-1) | n/a   | 86.9 ns |
+| `chan_mpmc_4x4` | 181 ns | **100 ns** | 96 | 287 | n/a   | n/a   | skipped |
+| `chan_try_uncontended` | **15.4 ns** | 60 | 34.5 | 38.9 | n/a   | n/a   | 31.9 ns |
+| `chan_create_buf8` cold | 6.5k | **140** | 282 | 168 | n/a   | n/a   | n/a   |
+| `chan_create_buf8_pooled` | **34.3 ns** | 140 | 282 | 168 | n/a   | n/a   | n/a   |
+| `chan_closed_drain` | 22.8 | 20 | **18.2** | 22.3 | n/a   | n/a   | **15.4 ns** |
+| `chan_prodcons_work` | **24.6 ns** | 220 | 32.7 | 278 | n/a   | n/a   | skipped |
+| `chan_popular_256` | **87.5 ns** | 618 | 2015 | 192k | n/a   | n/a   | n/a   |
+| `chan_sem` | **11.8 ns** | 40 | 27.2 | 43 | n/a   | n/a   | n/a   |
+| `actor_mailbox` | **15.4 ns** | 100 | 22.1 | 164 | n/a   | n/a   | n/a   |
 
-1. **Closest fair match — Go.** Both models: stackful M:N + CSP. On this run, zigroutines is faster than Go on yield and channel pipeline; Go wins on `spawn_join` / contended mutex / nursery (mature runtime, OS futex, cheap spawn).
-2. **C++ is a thread baseline, not “C++ fibers.”** ISO C++ has no standard fiber runtime. `spawn_join` and `nursery_join` on OS threads are predictably 1–2 orders of magnitude heavier. C++ `yield_ws_4w` looks “fast” because `std::this_thread::yield` is not a fiber context-switch.
-3. **Rust (Tokio / crossbeam)** is not in this table: the machine lacked a toolchain. Expectation: threads+crossbeam ≈ C++ class; Tokio is a *different* model (stackless async), not ns-for-ns with fibers.
-4. **Not absolute truth.** One run, one OS, quiet load. Re-check locally: `zig build bench -Doptimize=ReleaseFast`.
-5. **Product takeaway:** on the hot path (yield, buffered/rendezvous channel, select, actor mailbox) zigroutines is competitive with a Go-shaped API **without GC and without a hidden runtime**. Where an OS primitive (contended mutex) or amortized Go spawn wins — that is a mechanism difference, not a table bug.
+
+#### Select
+
+| Workload | **zigroutines** | **Go** | **Rust/Tokio** | **C++** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|-------:|---------------:|--------:|------------:|-----------:|--------:|
+| `select_fanin_2` | **47.5 ns** | 220 | 234 | 257 | n/a   | n/a   | skipped |
+| `select_uncontended` | **20.7 ns** | 116 | 155 | 48.5 | n/a   | n/a   | skipped |
+| `select_nonblock` | **18.9 ns** | 85 | 25.3 | 34.5 | n/a   | n/a   | skipped |
+| `select_sync_contended` | **75.4 ns** | 367 | 283 | 307 | n/a   | n/a   | skipped |
+
+#### Sync / timers
+
+| Workload | **zigroutines** | **Go** | **Rust** | **C++** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|-------:|---------:|--------:|------------:|-----------:|--------:|
+| `mutex_uncontended` | **15 ns** | 15.0 | 16.0 | 16.5 | n/a   | n/a   | 14.3 ns |
+| `mutex_contended_4` | 537 ns | **30** | 128 | 46 | n/a   | n/a   | skipped |
+| `sem_handoff` | **17.7 ns** | 80 | 95.5 | 149 | n/a   | n/a   | 48.1 ns |
+| `rwlock_shared_4` | 152 | **40** | 131 | 643 | n/a   | n/a   | skipped |
+| `rwlock_exclusive` | **16.6 ns** | 30 | **15.5** | 96.8 | n/a   | n/a   | 27.7 ns |
+| `timer_sleep_batch` | **~500 ns** | 804 | 5105 | 68k | n/a   | n/a   | 2060 ns |
+| `timer_many_100k_dispatch` | **~670 ns** | 558 | 811 | 214k ‖ | n/a   | 1000 ns | n/a   |
+
+
+#### I/O
+
+| Workload | **zigroutines** | **Go** | **Rust** | **C++** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|-------:|---------:|--------:|------------:|-----------:|--------:|
+| `tcp_pingpong` | **~100k RT/s** | n/a | n/a | n/a | n/a   | ~68k RT/s · 14.7 µs/RT | skipped |
+| `udp_ping` | **~350k pkt/s** | n/a | n/a | n/a | n/a   | ~204k pkt/s · 4.9 µs/pkt | skipped |
 
 
 ## 6. Runtime configuration (cheat sheet)
@@ -554,14 +578,19 @@ Numbers are **ns/op** (lower is better). A dash means that workload had no direc
 var rt = try zr.Runtime.init(alloc, .{
     .workers = 4,                    // 0 = CPU count
     .policy = .work_stealing,        // auto | single_thread_fifo | work_stealing | priority | thread_per_task
-    .default_stack_size = 64 * 1024,
-    .stack_pool = true,
-    .stack_guard_page = false,
-    .stack_paint_canary = false,
+    .stack_pool = true,              // 2 KiB stack freelist (default)
+    .task_freelist = true,           // recycle Task control blocks (default)
+    .stack_guard_page = false,       // opt-in overflow fault
+    .stack_paint_canary = false,     // opt-in high-water measurement
     .io = .none,                     // none | poll | iocp | io_uring
     .metrics = false,
     .preempt = .{ .enabled = false, .quantum_ns = ... },
 });
+
+// Fixed 2 KiB stack for all stackful tasks
+_ = try rt.spawn(.{}, work, .{});
+// Opt-in stackless leaf (no private stack; must run to completion — no park/yield/channel):
+_ = try rt.spawnLeaf(.{}, pureCompute, .{});
 ```
 
 Optional features (all opt-in):

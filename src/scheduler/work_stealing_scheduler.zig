@@ -163,10 +163,26 @@ pub const WorkStealingScheduler = struct {
                 t.state = .running;
                 t.on_cpu.store(true, .release);
                 task_mod.setCurrent(t);
+                if (t.isLeaf()) {
+                    task_mod.runLeafOnWorker(t);
+                    task_mod.setCurrent(null);
+                    t.on_cpu.store(false, .release);
+                    t.state = .dead;
+                    t.finished.store(true, .release);
+                    t.finishJoiners();
+                    _ = engine.live_tasks.fetchSub(1, .monotonic);
+                    if (engine.metrics) |m| m.inc(.finishes);
+                    t.destroy();
+                    w.running = null;
+                    continue;
+                }
                 context.swap(&w.sched_ctx, &t.ctx);
                 task_mod.setCurrent(null);
                 t.on_cpu.store(false, .release);
                 w.running = null;
+                if (task_mod.takeBounceAndRun(t)) {
+                    engine.enqueue(t) catch @panic("zigroutines: OOM requeue after bounce");
+                }
                 continue;
             }
             if (engine.live_tasks.load(.acquire) == 0) {
@@ -210,16 +226,17 @@ pub const WorkStealingScheduler = struct {
     pub fn yieldFromRunning(self: *WorkStealingScheduler) void {
         const w = tls_worker orelse @panic("zigroutines: yield outside worker");
         const t = w.running orelse @panic("zigroutines: yield with no running task");
+        if (self.metrics) |m| m.inc(.yields);
         t.state = .ready;
         t.scheduled.store(true, .release);
         w.local.push(t) catch @panic("zigroutines: OOM yield");
-        if (self.metrics) |m| m.inc(.yields);
         context.swap(&t.ctx, &w.sched_ctx);
     }
 
     pub fn parkFromRunning(self: *WorkStealingScheduler, reason: task_mod.WaitReason) void {
         const w = tls_worker orelse @panic("zigroutines: park outside worker");
         const t = w.running orelse @panic("zigroutines: park with no running task");
+        task_mod.requireStackfulForPark();
         t.state = .blocked;
         t.blocked_on = reason;
         t.scheduled.store(false, .release);

@@ -2,14 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("../core/synchronization.zig");
 
-pub const default_stack_size: usize = 64 * 1024;
-
-pub const pool_size_classes = [_]usize{
-    16 * 1024,
-    64 * 1024,
-    256 * 1024,
-    1024 * 1024,
-};
+pub const fiber_stack_size: usize = 2 * 1024;
+pub const default_stack_size: usize = fiber_stack_size;
+pub const min_stack_size: usize = fiber_stack_size;
+pub const pool_size_classes = [_]usize{fiber_stack_size};
 
 pub const AllocOptions = struct {
     guard_page: bool = false,
@@ -58,11 +54,13 @@ pub const Stack = struct {
 };
 
 pub fn alloc(allocator: std.mem.Allocator, size: usize) !Stack {
-    return allocWith(allocator, size, .{});
+    _ = size;
+    return allocWith(allocator, fiber_stack_size, .{});
 }
 
 pub fn allocWith(allocator: std.mem.Allocator, size: usize, opts: AllocOptions) !Stack {
-    const usable_size = @max(page_size, std.mem.alignForward(usize, size, 16));
+    _ = size;
+    const usable_size = fiber_stack_size;
 
     if (opts.guard_page) {
         return allocGuarded(usable_size, opts.paint_canary);
@@ -79,9 +77,9 @@ pub fn allocWith(allocator: std.mem.Allocator, size: usize, opts: AllocOptions) 
 }
 
 fn allocGuarded(usable_size: usize, paint: bool) !Stack {
-    const total = page_size + usable_size;
+    const total = std.mem.alignForward(usize, page_size + usable_size, page_size);
     if (comptime builtin.os.tag == .windows) {
-        const base = VirtualAlloc(
+        const raw = VirtualAlloc(
             null,
             total,
             MEM_COMMIT | MEM_RESERVE,
@@ -89,11 +87,11 @@ fn allocGuarded(usable_size: usize, paint: bool) !Stack {
         ) orelse return error.OutOfMemory;
 
         var old: u32 = undefined;
-        if (VirtualProtect(base, page_size, PAGE_NOACCESS, &old) == 0) {
-            _ = VirtualFree(base, 0, MEM_RELEASE);
+        if (VirtualProtect(raw, page_size, PAGE_NOACCESS, &old) == 0) {
+            _ = VirtualFree(raw, 0, MEM_RELEASE);
             return error.Unexpected;
         }
-        const all: [*]align(page_size) u8 = @ptrCast(@alignCast(base));
+        const all: [*]align(page_size) u8 = @ptrFromInt(@intFromPtr(raw));
         const usable = all[page_size .. page_size + usable_size];
         if (paint) @memset(usable, canary_byte);
         return .{
@@ -142,7 +140,7 @@ pub const Pool = struct {
     allocator: std.mem.Allocator,
     lock: sync.SpinLock = .{},
     free_lists: [pool_size_classes.len]std.ArrayListUnmanaged([]align(16) u8) = @splat(.empty),
-    max_per_class: usize = 64,
+    max_per_class: usize = 1024,
     guard_page: bool = false,
     paint_canary: bool = false,
 
@@ -153,7 +151,7 @@ pub const Pool = struct {
     pub fn initWith(allocator: std.mem.Allocator, opts: struct {
         guard_page: bool = false,
         paint_canary: bool = false,
-        max_per_class: usize = 64,
+        max_per_class: usize = 1024,
     }) Pool {
         return .{
             .allocator = allocator,
@@ -174,17 +172,16 @@ pub const Pool = struct {
     }
 
     pub fn acquire(self: *Pool, min_size: usize) !Stack {
+        _ = min_size;
         if (self.guard_page) {
-            return allocWith(self.allocator, min_size, .{
+            return allocWith(self.allocator, fiber_stack_size, .{
                 .guard_page = true,
                 .paint_canary = self.paint_canary,
             });
         }
 
-        const idx = classIndex(min_size) orelse {
-            return allocWith(self.allocator, min_size, .{ .paint_canary = self.paint_canary });
-        };
-        const class_size = pool_size_classes[idx];
+        const idx: usize = 0;
+        const class_size = fiber_stack_size;
 
         self.lock.lock();
         defer self.lock.unlock();
@@ -196,7 +193,7 @@ pub const Pool = struct {
                 .memory = memory,
                 .usable = memory,
                 .from_pool = true,
-                .class_index = @intCast(idx),
+                .class_index = 0,
             };
         }
         const memory = try self.allocator.alignedAlloc(u8, .fromByteUnits(16), class_size);
@@ -205,7 +202,7 @@ pub const Pool = struct {
             .memory = memory,
             .usable = memory,
             .from_pool = true,
-            .class_index = @intCast(idx),
+            .class_index = 0,
         };
     }
 
@@ -241,13 +238,6 @@ pub const Pool = struct {
             }
             list.clearRetainingCapacity();
         }
-    }
-
-    fn classIndex(min_size: usize) ?usize {
-        for (pool_size_classes, 0..) |sz, i| {
-            if (min_size <= sz) return i;
-        }
-        return null;
     }
 };
 

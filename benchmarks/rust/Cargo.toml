@@ -1,0 +1,13 @@
+[package]
+name = "zigroutines-bench-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bench_rust"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+crossbeam-channel = "0.5"

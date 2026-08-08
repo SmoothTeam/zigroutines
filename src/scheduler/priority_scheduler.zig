@@ -96,10 +96,26 @@ pub const PriorityScheduler = struct {
                 task_mod.setCurrent(next);
                 preempt.onTaskStart();
                 trace.emitTask(.task_start, next, 0);
+                if (next.isLeaf()) {
+                    task_mod.runLeafOnWorker(next);
+                    task_mod.setCurrent(null);
+                    next.on_cpu.store(false, .release);
+                    next.state = .dead;
+                    next.finished.store(true, .release);
+                    next.finishJoiners();
+                    if (self.live > 0) self.live -= 1;
+                    if (self.metrics) |m| m.inc(.finishes);
+                    next.destroy();
+                    self.running = null;
+                    continue;
+                }
                 context.swap(&self.sched_ctx, &next.ctx);
                 task_mod.setCurrent(null);
                 next.on_cpu.store(false, .release);
                 self.running = null;
+                if (task_mod.takeBounceAndRun(next)) {
+                    self.enqueue(next) catch @panic("zigroutines: OOM requeue after bounce");
+                }
                 continue;
             }
 
@@ -131,11 +147,10 @@ pub const PriorityScheduler = struct {
 
             if (self.timers) |tq| {
                 if (tq.nextDeadlineNs()) |deadline| {
-                    var guard: u32 = 0;
                     while (timer_mod.nowNs() < deadline and self.ready.isEmpty()) {
-                        std.Thread.yield() catch {};
-                        guard +%= 1;
-                        if (guard > 10_000_000) break;
+                        timer_mod.sleepUntilDeadline(deadline);
+                        _ = tq.fireExpired();
+                        if (!self.ready.isEmpty()) break;
                     }
                     _ = tq.fireExpired();
                     if (!self.ready.isEmpty() or tq.nextDeadlineNs() != null) continue;
@@ -151,16 +166,17 @@ pub const PriorityScheduler = struct {
 
     pub fn yieldFromRunning(self: *PriorityScheduler) void {
         const t = self.running orelse @panic("zigroutines: yield with no running task");
+        if (self.metrics) |m| m.inc(.yields);
+        trace.emitTask(.task_yield, t, 0);
         t.state = .ready;
         t.scheduled.store(true, .release);
         self.ready.push(t.priority, t) catch @panic("zigroutines: OOM on yield enqueue");
-        if (self.metrics) |m| m.inc(.yields);
-        trace.emitTask(.task_yield, t, 0);
         context.swap(&t.ctx, &self.sched_ctx);
     }
 
     pub fn parkFromRunning(self: *PriorityScheduler, reason: task_mod.WaitReason) void {
         const t = self.running orelse @panic("zigroutines: park with no running task");
+        task_mod.requireStackfulForPark();
         t.state = .blocked;
         t.blocked_on = reason;
         t.scheduled.store(false, .release);

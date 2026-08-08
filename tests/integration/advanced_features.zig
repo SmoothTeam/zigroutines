@@ -470,10 +470,10 @@ test "stack guard page allocates" {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const st = try zr.stack.allocWith(alloc, 16 * 1024, .{ .guard_page = true, .paint_canary = true });
+    const st = try zr.stack.allocWith(alloc, 0, .{ .guard_page = true, .paint_canary = true });
     defer zr.stack.free(alloc, st);
     try std.testing.expect(st.has_guard);
-    try std.testing.expect(st.usable.len >= 16 * 1024);
+    try std.testing.expectEqual(zr.stack.fiber_stack_size, st.usable.len);
 }
 
 test "iocp backend create/destroy" {

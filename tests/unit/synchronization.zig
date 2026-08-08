@@ -72,6 +72,69 @@ test "synchronization: rate limiter tryAcquire" {
     try std.testing.expect(!limiter.tryAcquire());
 }
 
+test "synchronization: notify wakes waiter" {
+    if (!zr.context.supported) return error.SkipZigTest;
+
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var rt = try zr.Runtime.init(alloc, .{ .workers = 1, .stack_pool = false });
+    defer rt.deinit();
+
+    var n = zr.Notify.init(alloc);
+    defer n.deinit();
+
+    const S = struct {
+        var ok: bool = false;
+        fn waiter(note: *zr.Notify) void {
+            note.wait();
+            ok = true;
+        }
+        fn signaler(note: *zr.Notify) void {
+            zr.yield();
+            note.notifyOne();
+        }
+    };
+    S.ok = false;
+    _ = try rt.spawn(.{}, S.waiter, .{&n});
+    _ = try rt.spawn(.{}, S.signaler, .{&n});
+    try rt.run();
+    try std.testing.expect(S.ok);
+}
+
+test "synchronization: watch broadcasts latest" {
+    if (!zr.context.supported) return error.SkipZigTest;
+
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var rt = try zr.Runtime.init(alloc, .{ .workers = 1, .stack_pool = false });
+    defer rt.deinit();
+
+    const W = zr.Watch(u32);
+    var w = W.init(alloc);
+    defer w.deinit();
+
+    const S = struct {
+        var got: u32 = 0;
+        fn consumer(watch: *W) void {
+            const pair = watch.recv(0);
+            got = pair[0];
+        }
+        fn producer(watch: *W) void {
+            zr.yield();
+            watch.send(42);
+        }
+    };
+    S.got = 0;
+    _ = try rt.spawn(.{}, S.consumer, .{&w});
+    _ = try rt.spawn(.{}, S.producer, .{&w});
+    try rt.run();
+    try std.testing.expectEqual(@as(u32, 42), S.got);
+}
+
 test "synchronization: parking lot wakeOne" {
     if (!zr.context.supported) return error.SkipZigTest;
 

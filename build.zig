@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const tcp_echo_step = b.step("tcp-echo-manual", "Run TCP echo manual harness");
     tcp_echo_step.dependOn(&tcp_echo_run.step);
 
-    // Micro-benchmarks
+    // Benchmarks (fiber/CSP/sync/timer/IO + scale)
     const bench_exe = b.addExecutable(.{
         .name = "zigroutines-bench",
         .root_module = b.createModule(.{
