@@ -21,20 +21,32 @@ pub fn runAll(alloc: std.mem.Allocator) !void {
         std.debug.print("udp_ping: skip (no poll net)\n", .{});
         return;
     }
-    try tcpPingPong(alloc);
-    try udpPing(alloc);
+    try tcpPingPong(alloc, .poll);
+    try udpPing(alloc, .poll);
+    if (comptime builtin.os.tag == .windows) {
+        try tcpPingPong(alloc, .iocp);
+    }
+    if (comptime builtin.os.tag == .linux) {
+        try tcpPingPong(alloc, .io_uring);
+        try udpPing(alloc, .io_uring);
+    }
 }
 
-fn tcpPingPong(alloc: std.mem.Allocator) !void {
+fn tcpPingPong(alloc: std.mem.Allocator, io_kind: zr.Config.IoConfig) !void {
     const rounds: usize = 20_000;
     var rt = try zr.Runtime.init(alloc, .{
         .workers = 1,
-        .stack_pool = true,
-        .io = .poll,
+        .stack_pool = io_kind != .iocp,
+        .io = io_kind,
     });
     defer rt.deinit();
+    const tag: []const u8 = switch (io_kind) {
+        .iocp => "tcp_pingpong_iocp",
+        .io_uring => "tcp_pingpong_io_uring",
+        else => "tcp_pingpong",
+    };
     const bio = rt.ioBackend() orelse {
-        std.debug.print("tcp_pingpong: skip (no io backend)\n", .{});
+        std.debug.print("{s}: skip (no io backend)\n", .{tag});
         return;
     };
 
@@ -138,23 +150,33 @@ fn tcpPingPong(alloc: std.mem.Allocator) !void {
 
     const completed = done_ch.tryRecv() catch 0;
     if (completed == 0) {
-        std.debug.print("tcp_pingpong: failed (0 roundtrips)\n", .{});
+        std.debug.print("{s}: failed (0 roundtrips)\n", .{tag});
         return;
     }
-    common.printThroughput("tcp_pingpong", completed, t1 - t0, "roundtrips");
-    common.printRate("tcp_pingpong_latency", completed, t1 - t0);
+    common.printThroughput(tag, completed, t1 - t0, "roundtrips");
+    const lat_tag: []const u8 = switch (io_kind) {
+        .iocp => "tcp_pingpong_iocp_latency",
+        .io_uring => "tcp_pingpong_io_uring_latency",
+        else => "tcp_pingpong_latency",
+    };
+    common.printRate(lat_tag, completed, t1 - t0);
 }
 
-fn udpPing(alloc: std.mem.Allocator) !void {
+fn udpPing(alloc: std.mem.Allocator, io_kind: zr.Config.IoConfig) !void {
     const rounds: usize = 10_000;
     var rt = try zr.Runtime.init(alloc, .{
         .workers = 1,
         .stack_pool = true,
-        .io = .poll,
+        .io = io_kind,
     });
     defer rt.deinit();
+    const tag: []const u8 = switch (io_kind) {
+        .iocp => "udp_ping_iocp",
+        .io_uring => "udp_ping_io_uring",
+        else => "udp_ping",
+    };
     const bio = rt.ioBackend() orelse {
-        std.debug.print("udp_ping: skip (no io backend)\n", .{});
+        std.debug.print("{s}: skip (no io backend)\n", .{tag});
         return;
     };
 
@@ -243,9 +265,14 @@ fn udpPing(alloc: std.mem.Allocator) !void {
 
     const completed = done_ch.tryRecv() catch 0;
     if (completed == 0) {
-        std.debug.print("udp_ping: failed (0 packets)\n", .{});
+        std.debug.print("{s}: failed (0 packets)\n", .{tag});
         return;
     }
-    common.printThroughput("udp_ping", completed, t1 - t0, "pkts");
-    common.printRate("udp_ping_latency", completed, t1 - t0);
+    common.printThroughput(tag, completed, t1 - t0, "pkts");
+    const lat_tag: []const u8 = switch (io_kind) {
+        .iocp => "udp_ping_iocp_latency",
+        .io_uring => "udp_ping_io_uring_latency",
+        else => "udp_ping_latency",
+    };
+    common.printRate(lat_tag, completed, t1 - t0);
 }

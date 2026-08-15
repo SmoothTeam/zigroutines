@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const task_mod = @import("task.zig");
 const sync = @import("synchronization.zig");
@@ -115,16 +119,5 @@ pub const CancelToken = struct {
 };
 
 fn wakeTask(t: *task_mod.Task) void {
-    var spins: u32 = 0;
-    while (t.on_cpu.load(.acquire)) {
-        std.atomic.spinLoopHint();
-        spins +%= 1;
-        if (spins > 200) {
-            std.Thread.yield() catch {};
-            spins = 0;
-        }
-    }
-    if (t.executor) |ex| {
-        ex.enqueue(t) catch {};
-    }
+    task_mod.wakeTask(t);
 }

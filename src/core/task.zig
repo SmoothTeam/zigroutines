@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const stack_mod = @import("../stack/stack.zig");
 const context_mod = @import("../context/context.zig");
@@ -54,9 +58,31 @@ pub const SpawnOptions = struct {
     mode: TaskMode = .stackful,
     name: ?[:0]const u8 = null,
     priority: u8 = 128,
+    protect: stack_mod.StackProtect = .none,
     guard_page: bool = false,
     paint_canary: bool = false,
+    wait_group: ?*WaitGroup = null,
+
+    pub fn resolvedProtect(self: SpawnOptions) stack_mod.StackProtect {
+        if (self.protect != .none) return self.protect;
+        if (self.guard_page) return .guard;
+        return .none;
+    }
 };
+
+const tls_cache_cap: usize = 32;
+threadlocal var tls_task_free: [tls_cache_cap]?*Task = @splat(null);
+threadlocal var tls_task_n: u8 = 0;
+
+pub fn flushTlsTaskCache(allocator: std.mem.Allocator) void {
+    while (tls_task_n > 0) {
+        tls_task_n -= 1;
+        if (tls_task_free[tls_task_n]) |t| {
+            tls_task_free[tls_task_n] = null;
+            allocator.destroy(t);
+        }
+    }
+}
 
 pub const TaskCache = struct {
     allocator: std.mem.Allocator,
@@ -79,6 +105,7 @@ pub const TaskCache = struct {
     }
 
     pub fn deinit(self: *TaskCache) void {
+        flushTlsTaskCache(self.allocator);
         self.lockMutex();
         for (self.free.items) |t| {
             self.allocator.destroy(t);
@@ -89,10 +116,18 @@ pub const TaskCache = struct {
     }
 
     pub fn acquire(self: *TaskCache) !*Task {
+        if (self.enabled and tls_task_n > 0) {
+            tls_task_n -= 1;
+            const t = tls_task_free[tls_task_n].?;
+            tls_task_free[tls_task_n] = null;
+            t.recycled = false;
+            return t;
+        }
         if (self.enabled) {
             self.lockMutex();
             if (self.free.pop()) |t| {
                 self.unlockMutex();
+                t.recycled = false;
                 return t;
             }
             self.unlockMutex();
@@ -106,11 +141,22 @@ pub const TaskCache = struct {
             self.allocator.destroy(t);
             return;
         }
+        if (tls_task_n < tls_cache_cap) {
+            t.* = .{
+                .generation = t.generation,
+                .allocator = self.allocator,
+                .recycled = true,
+            };
+            tls_task_free[tls_task_n] = t;
+            tls_task_n += 1;
+            return;
+        }
         self.lockMutex();
         if (self.free.items.len < self.max) {
             t.* = .{
                 .generation = t.generation,
                 .allocator = self.allocator,
+                .recycled = true,
             };
             self.free.append(self.allocator, t) catch {
                 self.unlockMutex();
@@ -188,6 +234,7 @@ pub fn TypedJoinHandle(comptime R: type) type {
         raw: JoinHandle,
         slot: *ResultSlot(R),
         allocator: std.mem.Allocator,
+        owned: bool = true,
 
         const Self = @This();
 
@@ -195,25 +242,77 @@ pub fn TypedJoinHandle(comptime R: type) type {
             return self.raw.isDone();
         }
 
+        fn take(self: Self) void {
+            self.raw.task.result_slot = null;
+            self.raw.task.result_deinit = null;
+            if (self.owned) self.allocator.destroy(self.slot);
+        }
+
         pub fn join(self: Self) R {
             self.raw.join();
             const v = self.slot.value;
-            self.allocator.destroy(self.slot);
+            self.take();
             return v;
         }
 
         pub fn joinError(self: Self) anyerror!R {
             self.raw.join();
             if (self.slot.err) |e| {
-                self.allocator.destroy(self.slot);
+                self.take();
                 return e;
             }
             const v = self.slot.value;
-            self.allocator.destroy(self.slot);
+            self.take();
             return v;
         }
     };
 }
+
+pub const WaitGroup = struct {
+    remaining: std.atomic.Value(usize) = .init(0),
+    waiter: std.atomic.Value(?*Task) = .init(null),
+
+    pub fn add(self: *WaitGroup, n: usize) void {
+        _ = self.remaining.fetchAdd(n, .monotonic);
+    }
+
+    pub fn done(self: *WaitGroup) void {
+        const prev = self.remaining.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            if (self.waiter.swap(null, .acq_rel)) |t| {
+                waitUntilOffCpu(t);
+                if (t.state == .blocked) {
+                    if (t.executor) |ex| {
+                        ex.enqueue(t) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn wait(self: *WaitGroup) void {
+        if (self.remaining.load(.acquire) == 0) return;
+        const me = current() orelse {
+            while (self.remaining.load(.acquire) != 0) {
+                std.Thread.yield() catch {};
+            }
+            return;
+        };
+        const ex = me.executor orelse {
+            while (self.remaining.load(.acquire) != 0) {
+                std.Thread.yield() catch {};
+            }
+            return;
+        };
+        self.waiter.store(me, .release);
+        if (self.remaining.load(.acquire) == 0) {
+            _ = self.waiter.swap(null, .acq_rel);
+            return;
+        }
+        ex.parkFromRunning(.join);
+        _ = self.waiter.swap(null, .acq_rel);
+    }
+};
 
 pub fn ResultSlot(comptime R: type) type {
     return struct {
@@ -228,7 +327,8 @@ pub const Task = struct {
     generation: u64 = 0,
     state: State = .dead,
     stack: stack_mod.Stack = .{},
-    ctx: context_mod.Context = .{},
+    ctx_ptr: *context_mod.Context = undefined,
+    home_worker: u32 = std.math.maxInt(u32),
     blocked_on: WaitReason = .none,
     name: ?[:0]const u8 = null,
     priority: u8 = 128,
@@ -255,7 +355,22 @@ pub const Task = struct {
     bounce_fn: ?*const fn (*anyopaque) void = null,
     bounce_arg: ?*anyopaque = null,
 
+    wait_group: std.atomic.Value(?*WaitGroup) = .init(null),
+    requeue_next: ?*Task = null,
+
     recycled: bool = false,
+    embedded: bool = false,
+
+    pub fn checkProtect(self: *const Task) void {
+        if (!self.stack.has_cookie) return;
+        if (!self.stack.cookieIntact()) {
+            @panic("zigroutines: fiber stack overflow (canary)");
+        }
+    }
+
+    pub fn ctxPtr(self: *Task) *context_mod.Context {
+        return self.ctx_ptr;
+    }
 
     pub fn isLeaf(self: *const Task) bool {
         return self.mode == .leaf;
@@ -265,7 +380,14 @@ pub const Task = struct {
         return !self.finished.load(.acquire);
     }
 
+    pub fn notifyWaitGroup(self: *Task) void {
+        if (self.wait_group.swap(null, .acq_rel)) |wg| {
+            wg.done();
+        }
+    }
+
     pub fn finishJoiners(self: *Task) void {
+        self.notifyWaitGroup();
         self.join_lock.lock();
         var to_wake: [32]*Task = undefined;
         var n: usize = 0;
@@ -292,6 +414,18 @@ pub const Task = struct {
         self.recycled = true;
         self.result_slot = null;
         self.result_deinit = null;
+        if (self.embedded) {
+            self.generation +%= 1;
+            const pool = self.stack_pool;
+            const stack = self.stack;
+            const allocator = self.allocator;
+            if (pool) |p| {
+                p.release(stack);
+            } else {
+                stack_mod.free(allocator, stack);
+            }
+            return;
+        }
         if (self.stack.memory.len != 0 or self.stack.os_base != null) {
             if (self.stack_pool) |pool| {
                 pool.release(self.stack);
@@ -305,19 +439,18 @@ pub const Task = struct {
         const allocator = self.allocator;
         if (cache) |c| {
             self.generation +%= 1;
-            const gen = self.generation;
-            self.* = .{
-                .generation = gen,
-                .allocator = allocator,
-                .task_cache = cache,
-                .recycled = false,
-            };
             c.release(self);
         } else {
             allocator.destroy(self);
         }
     }
 };
+
+comptime {
+    if (@sizeOf(Task) > stack_mod.tcb_prefix) {
+        @compileError("Task does not fit in stack tcb_prefix");
+    }
+}
 
 pub fn waitUntilOffCpu(t: *Task) void {
     var spins: u32 = 0;
@@ -328,6 +461,16 @@ pub fn waitUntilOffCpu(t: *Task) void {
             std.Thread.yield() catch {};
             spins = 0;
         }
+    }
+}
+
+pub fn wakeTask(t: *Task) void {
+    waitUntilOffCpu(t);
+    if (t.state != .blocked) return;
+    if (t.executor) |ex| {
+        ex.enqueue(t) catch {
+            t.scheduled.store(false, .release);
+        };
     }
 }
 
@@ -344,12 +487,7 @@ const JoinSpin = struct {
 };
 
 fn wakeJoin(t: *Task) void {
-    waitUntilOffCpu(t);
-    if (t.state == .blocked) {
-        if (t.executor) |ex| {
-            ex.enqueue(t) catch {};
-        }
-    }
+    wakeTask(t);
 }
 
 fn taskTrampoline(arg: *anyopaque) callconv(.c) void {
@@ -383,6 +521,65 @@ pub const SpawnEnv = struct {
     cache: ?*TaskCache = null,
 };
 
+const PreparedSpawn = struct {
+    task: *Task,
+    stack: stack_mod.Stack,
+    use_pool: bool,
+    embedded: bool,
+};
+
+fn taskAtSlot(stack: stack_mod.Stack) *Task {
+    return @ptrCast(@alignCast(stack.memory.ptr + stack_mod.fiber_stack_size));
+}
+
+fn prepareSpawn(env: SpawnEnv, opts: SpawnOptions) !PreparedSpawn {
+    const is_leaf = opts.mode == .leaf;
+    const protect = opts.resolvedProtect();
+    const embed = !is_leaf and protect != .guard and env.pool != null;
+
+    if (embed) {
+        const stack = try env.pool.?.acquireFor(protect, opts.paint_canary);
+        const t = taskAtSlot(stack);
+        const gen = t.generation;
+        t.* = .{
+            .generation = gen,
+            .embedded = true,
+            .allocator = env.allocator,
+        };
+        return .{ .task = t, .stack = stack, .use_pool = true, .embedded = true };
+    }
+
+    const t = if (env.cache) |c| try c.acquire() else try env.allocator.create(Task);
+    errdefer {
+        if (env.cache) |c| c.release(t) else env.allocator.destroy(t);
+    }
+    var stack: stack_mod.Stack = .{};
+    var use_pool = false;
+    if (!is_leaf) {
+        if (env.pool) |p| {
+            stack = try p.acquireFor(protect, opts.paint_canary);
+            use_pool = true;
+        } else {
+            stack = try stack_mod.allocWith(env.allocator, stack_mod.fiber_stack_size, .{
+                .protect = protect,
+                .paint_canary = opts.paint_canary,
+            });
+        }
+    }
+    return .{ .task = t, .stack = stack, .use_pool = use_pool, .embedded = false };
+}
+
+fn releasePrepared(env: SpawnEnv, p: PreparedSpawn) void {
+    if (p.embedded) {
+        if (p.use_pool) env.pool.?.release(p.stack) else stack_mod.free(env.allocator, p.stack);
+        return;
+    }
+    if (p.stack.memory.len != 0 or p.stack.os_base != null) {
+        if (p.use_pool) env.pool.?.release(p.stack) else stack_mod.free(env.allocator, p.stack);
+    }
+    if (env.cache) |c| c.release(p.task) else env.allocator.destroy(p.task);
+}
+
 pub fn spawnOn(
     executor: executor_mod.Executor,
     allocator: std.mem.Allocator,
@@ -412,29 +609,14 @@ pub fn spawnOnEnv(
     const Args = @TypeOf(args);
     const zero_args = @sizeOf(Args) == 0;
 
-    const t = if (env.cache) |c| try c.acquire() else try env.allocator.create(Task);
-    errdefer {
-        if (env.cache) |c| c.release(t) else env.allocator.destroy(t);
-    }
+    const prepared = try prepareSpawn(env, opts);
+    const t = prepared.task;
+    const stack = prepared.stack;
+    const use_pool = prepared.use_pool;
+    const embedded = prepared.embedded;
+    errdefer releasePrepared(env, prepared);
 
     const is_leaf = opts.mode == .leaf;
-    var stack: stack_mod.Stack = .{};
-    var use_pool = false;
-
-    if (!is_leaf) {
-        const use_direct = opts.guard_page or opts.paint_canary or env.pool == null;
-        stack = if (!use_direct)
-            try env.pool.?.acquire(stack_mod.fiber_stack_size)
-        else
-            try stack_mod.allocWith(env.allocator, stack_mod.fiber_stack_size, .{
-                .guard_page = opts.guard_page,
-                .paint_canary = opts.paint_canary,
-            });
-        use_pool = !use_direct;
-        errdefer {
-            if (use_pool) env.pool.?.release(stack) else stack_mod.free(env.allocator, stack);
-        }
-    }
 
     var user_data: ?*anyopaque = null;
     const entry_fn: *const fn (*Task) void = if (comptime zero_args)
@@ -447,16 +629,25 @@ pub fn spawnOnEnv(
     else blk: {
         const Wrapper = struct {
             args: Args,
+            owned: bool = true,
             fn entry(task: *Task) void {
                 const w: *@This() = @ptrCast(@alignCast(task.user_data.?));
                 _ = @call(.auto, func, w.args);
-                task.allocator.destroy(w);
+                const owned = w.owned;
                 task.user_data = null;
+                if (owned) task.allocator.destroy(w);
             }
         };
+        if (!is_leaf) {
+            if (placeOnStack(stack.bytes(), frameStart(stack), Wrapper)) |w| {
+                w.* = .{ .args = args, .owned = false };
+                user_data = w;
+                break :blk Wrapper.entry;
+            }
+        }
         const wrapper = try env.allocator.create(Wrapper);
         errdefer env.allocator.destroy(wrapper);
-        wrapper.* = .{ .args = args };
+        wrapper.* = .{ .args = args, .owned = true };
         user_data = wrapper;
         break :blk Wrapper.entry;
     };
@@ -473,9 +664,11 @@ pub fn spawnOnEnv(
         .allocator = env.allocator,
         .executor = env.executor,
         .stack_pool = if (use_pool) env.pool else null,
-        .task_cache = env.cache,
+        .task_cache = if (embedded) null else env.cache,
+        .embedded = embedded,
         .entry_fn = entry_fn,
         .user_data = user_data,
+        .wait_group = .init(opts.wait_group),
         .on_cpu = .init(false),
         .finished = .init(false),
         .scheduled = .init(false),
@@ -484,9 +677,9 @@ pub fn spawnOnEnv(
     };
 
     if (!is_leaf) {
-        context_mod.make(&t.ctx, t.stack.bytes(), taskTrampoline, t);
-    } else {
-        t.ctx = .{};
+        const placed = placeContextTop(t.stack.bytes());
+        t.ctx_ptr = placed.ctx;
+        context_mod.make(placed.ctx, placed.rest, taskTrampoline, t);
     }
     try env.executor.enqueue(t);
 
@@ -523,9 +716,10 @@ pub fn spawnOnResultEnv(
     const Args = @TypeOf(args);
     const Slot = ResultSlot(R);
 
-    const Wrapper = struct {
+    const Frame = struct {
         args: Args,
-        slot: *Slot,
+        slot: Slot,
+        owned: bool = false,
 
         fn entry(t: *Task) void {
             const w: *@This() = @ptrCast(@alignCast(t.user_data.?));
@@ -541,42 +735,47 @@ pub fn spawnOnResultEnv(
                 w.slot.value = @call(.auto, func, w.args);
                 w.slot.has_value = true;
             }
-            t.allocator.destroy(w);
+            const owned = w.owned;
             t.user_data = null;
+            if (owned) t.allocator.destroy(w);
         }
     };
 
-    const t = if (env.cache) |c| try c.acquire() else try env.allocator.create(Task);
-    errdefer {
-        if (env.cache) |c| c.release(t) else env.allocator.destroy(t);
-    }
+    const prepared = try prepareSpawn(env, opts);
+    const t = prepared.task;
+    const stack = prepared.stack;
+    const use_pool = prepared.use_pool;
+    const embedded = prepared.embedded;
+    errdefer releasePrepared(env, prepared);
 
     const is_leaf = opts.mode == .leaf;
-    var stack: stack_mod.Stack = .{};
-    var use_pool = false;
+
+    var slot_ptr: *Slot = undefined;
+    var user_data: ?*anyopaque = null;
+    var owned = true;
+    var result_deinit: ?*const fn (*anyopaque, std.mem.Allocator) void = null;
 
     if (!is_leaf) {
-        const use_direct = opts.guard_page or opts.paint_canary or env.pool == null;
-        stack = if (!use_direct)
-            try env.pool.?.acquire(stack_mod.fiber_stack_size)
-        else
-            try stack_mod.allocWith(env.allocator, stack_mod.fiber_stack_size, .{
-                .guard_page = opts.guard_page,
-                .paint_canary = opts.paint_canary,
-            });
-        use_pool = !use_direct;
-        errdefer {
-            if (use_pool) env.pool.?.release(stack) else stack_mod.free(env.allocator, stack);
+        if (placeOnStack(stack.bytes(), frameStart(stack), Frame)) |frame| {
+            frame.* = .{ .args = args, .slot = .{}, .owned = false };
+            slot_ptr = &frame.slot;
+            user_data = frame;
+            owned = false;
         }
     }
-
-    const slot = try env.allocator.create(Slot);
-    errdefer env.allocator.destroy(slot);
-    slot.* = .{};
-
-    const wrapper = try env.allocator.create(Wrapper);
-    errdefer env.allocator.destroy(wrapper);
-    wrapper.* = .{ .args = args, .slot = slot };
+    if (user_data == null) {
+        const frame = try env.allocator.create(Frame);
+        errdefer env.allocator.destroy(frame);
+        frame.* = .{ .args = args, .slot = .{}, .owned = true };
+        slot_ptr = &frame.slot;
+        user_data = frame;
+        result_deinit = struct {
+            fn d(p: *anyopaque, a: std.mem.Allocator) void {
+                const f: *Frame = @ptrCast(@alignCast(p));
+                a.destroy(f);
+            }
+        }.d;
+    }
 
     const gen = t.generation;
     t.* = .{
@@ -590,16 +789,13 @@ pub fn spawnOnResultEnv(
         .allocator = env.allocator,
         .executor = env.executor,
         .stack_pool = if (use_pool) env.pool else null,
-        .task_cache = env.cache,
-        .entry_fn = Wrapper.entry,
-        .user_data = wrapper,
-        .result_slot = slot,
-        .result_deinit = struct {
-            fn d(p: *anyopaque, a: std.mem.Allocator) void {
-                const s: *Slot = @ptrCast(@alignCast(p));
-                a.destroy(s);
-            }
-        }.d,
+        .task_cache = if (embedded) null else env.cache,
+        .embedded = embedded,
+        .entry_fn = Frame.entry,
+        .user_data = user_data,
+        .result_slot = slot_ptr,
+        .result_deinit = result_deinit,
+        .wait_group = .init(opts.wait_group),
         .on_cpu = .init(false),
         .finished = .init(false),
         .scheduled = .init(false),
@@ -608,17 +804,51 @@ pub fn spawnOnResultEnv(
     };
 
     if (!is_leaf) {
-        context_mod.make(&t.ctx, t.stack.bytes(), taskTrampoline, t);
-    } else {
-        t.ctx = .{};
+        const placed = placeContextTop(t.stack.bytes());
+        t.ctx_ptr = placed.ctx;
+        context_mod.make(placed.ctx, placed.rest, taskTrampoline, t);
     }
     try env.executor.enqueue(t);
 
     return .{
         .raw = .{ .task = t, .generation = gen },
-        .slot = slot,
+        .slot = slot_ptr,
         .allocator = env.allocator,
+        .owned = owned,
     };
+}
+
+const inline_frame_limit: usize = 512;
+
+fn contextReserve() usize {
+    return std.mem.alignForward(usize, @sizeOf(context_mod.Context), 16);
+}
+
+fn frameStart(stack: stack_mod.Stack) usize {
+    return if (stack.has_cookie) stack_mod.cookie_size else 0;
+}
+
+const PlacedCtx = struct {
+    ctx: *context_mod.Context,
+    rest: []u8,
+};
+
+fn placeContextTop(usable: []u8) PlacedCtx {
+    const reserve = contextReserve();
+    std.debug.assert(usable.len > reserve + 256);
+    const rest_len = usable.len - reserve;
+    const ctx: *context_mod.Context = @ptrCast(@alignCast(usable.ptr + rest_len));
+    ctx.* = .{};
+    return .{ .ctx = ctx, .rest = usable[0..rest_len] };
+}
+
+fn placeOnStack(usable: []u8, start: usize, comptime T: type) ?*T {
+    if (comptime @sizeOf(T) == 0) return null;
+    if (comptime @sizeOf(T) > inline_frame_limit) return null;
+    const aligned = std.mem.alignForward(usize, start, @alignOf(T));
+    const reserve = contextReserve();
+    if (aligned + @sizeOf(T) + 256 + reserve > usable.len) return null;
+    return @ptrCast(@alignCast(usable.ptr + aligned));
 }
 
 fn ResultTypeOf(comptime func: anytype) type {
@@ -651,6 +881,23 @@ pub fn requireStackfulForPark() void {
     if (t.isLeaf()) {
         @panic("zigroutines: park in leaf task — leaf tasks must run to completion; use stackful spawn for channels/timers/I/O");
     }
+}
+
+threadlocal var tls_pending_bounce: ?*Task = null;
+
+pub fn noteBounce(t: *Task) void {
+    tls_pending_bounce = t;
+}
+
+pub fn takePendingBounce() ?*Task {
+    const t = tls_pending_bounce;
+    tls_pending_bounce = null;
+    return t;
+}
+
+pub fn runPendingBounce() bool {
+    const t = takePendingBounce() orelse return false;
+    return takeBounceAndRun(t);
 }
 
 pub fn callOnWorkerStack(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) CallReturn(@TypeOf(func)) {

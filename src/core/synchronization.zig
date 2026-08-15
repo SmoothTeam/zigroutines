@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const task_mod = @import("task.zig");
 const list = @import("../utils/intrusive_list.zig");
@@ -23,12 +27,20 @@ pub const SpinLock = struct {
 };
 
 fn wakeTask(t: *task_mod.Task) void {
-    task_mod.waitUntilOffCpu(t);
-    if (t.state == .blocked) {
-        if (t.executor) |ex| {
-            ex.enqueue(t) catch {};
+    task_mod.wakeTask(t);
+}
+
+fn wakeOrHandoff(t: *task_mod.Task) void {
+    if (task_mod.current()) |me| {
+        if (me != t) {
+            if (me.executor) |ex| {
+                if (t.state == .blocked and !t.on_cpu.load(.acquire)) {
+                    if (ex.handoffFromRunning(t)) return;
+                }
+            }
         }
     }
+    wakeTask(t);
 }
 
 fn requireTask() *task_mod.Task {
@@ -282,7 +294,7 @@ pub const Mutex = struct {
                 self.state.store(contested, .release);
             }
             self.wait_lock.unlock();
-            if (parked) wakeTask(t);
+            if (parked) wakeOrHandoff(t);
             return;
         }
         self.state.store(unlocked, .release);
@@ -394,10 +406,13 @@ pub fn Watch(comptime T: type) type {
 
 pub const RwLock = struct {
     lock: SpinLock = .{},
-    readers: i32 = 0,
-    writer: bool = false,
+    state: std.atomic.Value(u32) = .init(0),
     read_waiters: list.List = .{},
     write_waiters: list.List = .{},
+
+    const writer_bit: u32 = 1 << 31;
+    const wait_bit: u32 = 1 << 30;
+    const reader_mask: u32 = wait_bit - 1;
 
     pub fn init(allocator: std.mem.Allocator) RwLock {
         _ = allocator;
@@ -408,12 +423,36 @@ pub const RwLock = struct {
         self.* = undefined;
     }
 
+    fn tryLockShared(self: *RwLock) bool {
+        var s = self.state.load(.monotonic);
+        while (s & (writer_bit | wait_bit) == 0) {
+            if (self.state.cmpxchgWeak(s, s + 1, .acquire, .monotonic)) |cur| {
+                s = cur;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn tryLockExclusive(self: *RwLock) bool {
+        var s = self.state.load(.monotonic);
+        while (s & reader_mask == 0 and s & writer_bit == 0) {
+            if (self.state.cmpxchgWeak(s, s | writer_bit, .acquire, .monotonic)) |cur| {
+                s = cur;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn lockShared(self: *RwLock) void {
+        if (self.tryLockShared()) return;
         const me = requireTask();
         while (true) {
             self.lock.lock();
-            if (!self.writer and self.write_waiters.isEmpty()) {
-                self.readers += 1;
+            if (self.tryLockShared()) {
                 self.lock.unlock();
                 return;
             }
@@ -428,28 +467,46 @@ pub const RwLock = struct {
     }
 
     pub fn unlockShared(self: *RwLock) void {
+        const prev = self.state.fetchSub(1, .release);
+        if ((prev & reader_mask) == 1 and (prev & wait_bit) != 0) {
+            self.wakeWriter();
+        }
+    }
+
+    fn wakeWriter(self: *RwLock) void {
         self.lock.lock();
-        self.readers -= 1;
-        if (self.readers == 0 and !self.write_waiters.isEmpty()) {
-            const node = self.write_waiters.popFront().?;
+        const s = self.state.load(.monotonic);
+        if ((s & reader_mask) != 0 or (s & writer_bit) != 0) {
+            self.lock.unlock();
+            return;
+        }
+        if (self.write_waiters.popFront()) |node| {
             const w: *Waiter = @fieldParentPtr("node", node);
-            self.writer = true;
+            var next: u32 = writer_bit;
+            if (!self.write_waiters.isEmpty()) next |= wait_bit;
+            if (self.state.cmpxchgStrong(s, next, .release, .monotonic) != null) {
+                self.write_waiters.pushFront(&w.node);
+                self.lock.unlock();
+                return;
+            }
             w.done = true;
             const parked = w.parked;
             const t = w.task;
             self.lock.unlock();
-            if (parked) wakeTask(t);
+            if (parked) wakeOrHandoff(t);
             return;
         }
+        _ = self.state.fetchAnd(~wait_bit, .release);
         self.lock.unlock();
     }
 
     pub fn lockExclusive(self: *RwLock) void {
+        if (self.tryLockExclusive()) return;
         const me = requireTask();
         while (true) {
             self.lock.lock();
-            if (!self.writer and self.readers == 0) {
-                self.writer = true;
+            _ = self.state.fetchOr(wait_bit, .acq_rel);
+            if (self.tryLockExclusive()) {
                 self.lock.unlock();
                 return;
             }
@@ -465,24 +522,24 @@ pub const RwLock = struct {
 
     pub fn unlockExclusive(self: *RwLock) void {
         self.lock.lock();
-        self.writer = false;
-        if (!self.write_waiters.isEmpty()) {
-            const node = self.write_waiters.popFront().?;
+        if (self.write_waiters.popFront()) |node| {
             const w: *Waiter = @fieldParentPtr("node", node);
-            self.writer = true;
+            var next: u32 = writer_bit;
+            if (!self.write_waiters.isEmpty()) next |= wait_bit;
+            self.state.store(next, .release);
             w.done = true;
             const parked = w.parked;
             const t = w.task;
             self.lock.unlock();
-            if (parked) wakeTask(t);
+            if (parked) wakeOrHandoff(t);
             return;
         }
 
         var batch: [64]*Waiter = undefined;
-        var total_readers: i32 = 0;
+        var first = true;
         while (true) {
-            if (self.writer or !self.write_waiters.isEmpty()) {
-                self.readers = total_readers;
+            if (!self.write_waiters.isEmpty()) {
+                if (first) self.state.store(0, .release);
                 self.lock.unlock();
                 return;
             }
@@ -493,12 +550,16 @@ pub const RwLock = struct {
                 n += 1;
             }
             if (n == 0) {
-                self.readers = total_readers;
+                if (first) self.state.store(0, .release);
                 self.lock.unlock();
                 return;
             }
-            total_readers += @intCast(n);
-            self.readers = total_readers;
+            if (first) {
+                self.state.store(@intCast(n), .release);
+                first = false;
+            } else {
+                _ = self.state.fetchAdd(@intCast(n), .acquire);
+            }
             self.lock.unlock();
             for (batch[0..n]) |w| {
                 w.done = true;

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const zr = @import("zigroutines");
 
@@ -25,6 +29,16 @@ test "chan: createWith full policies construct" {
         try std.testing.expect(!ch.isClosed());
         try std.testing.expectEqual(@as(usize, 0), ch.lenBuffered());
     }
+}
+
+test "chan: createPooled recycles same slot" {
+    const Ch = zr.Channel(u32);
+    const first = try Ch.createPooled(std.heap.page_allocator, 8);
+    const first_ptr: *Ch = first;
+    first.destroy();
+    const second = try Ch.createPooled(std.heap.page_allocator, 8);
+    defer second.destroy();
+    try std.testing.expectEqual(first_ptr, second);
 }
 
 test "chan: double close is idempotent" {

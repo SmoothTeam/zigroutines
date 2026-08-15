@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const builtin = @import("builtin");
 
 pub const wake = @import("task_wake.zig");

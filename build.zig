@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -45,6 +49,42 @@ pub fn build(b: *std.Build) void {
     const run_suite = b.addRunArtifact(suite_tests);
     const test_step = b.step("test", "Run unit + integration + io tests");
     test_step.dependOn(&run_suite.step);
+
+    const c_lib = b.addLibrary(.{
+        .name = "zigroutines",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .linkage = .static,
+    });
+    if (target.result.os.tag == .windows) {
+        c_lib.root_module.linkSystemLibrary("ws2_32", .{});
+        c_lib.root_module.linkSystemLibrary("ntdll", .{});
+    }
+    b.installArtifact(c_lib);
+    b.installFile("include/zigroutines.h", "include/zigroutines.h");
+
+    const c_abi_exe = b.addExecutable(.{
+        .name = "c-abi-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/abi/c_abi_stub.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    c_abi_exe.root_module.addCSourceFile(.{
+        .file = b.path("tests/abi/c_abi_main.c"),
+        .flags = &.{ "-std=c11" },
+    });
+    c_abi_exe.root_module.addIncludePath(b.path("include"));
+    c_abi_exe.root_module.linkLibrary(c_lib);
+    const run_c_abi = b.addRunArtifact(c_abi_exe);
+    test_step.dependOn(&run_c_abi.step);
+    const c_abi_step = b.step("c-abi-test", "Run the C ABI integration executable");
+    c_abi_step.dependOn(&run_c_abi.step);
 
     // Manual TCP echo harness
     const tcp_echo_exe = b.addExecutable(.{

@@ -1,81 +1,97 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 
 pub fn ChaseLevDeque(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
         buf: []T = &.{},
-        bottom: usize = 0,
-        top: usize = 0,
-        lock: std.atomic.Value(u8) = .init(0),
+        bottom: std.atomic.Value(usize) = .init(0),
+        top: std.atomic.Value(usize) = .init(0),
+        retired: std.ArrayListUnmanaged([]T) = .empty,
 
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator) !Self {
-            var self = Self{ .allocator = allocator };
-            self.buf = try allocator.alloc(T, 64);
-            return self;
+            return .{
+                .allocator = allocator,
+                .buf = try allocator.alloc(T, 64),
+            };
         }
 
         pub fn deinit(self: *Self) void {
             if (self.buf.len != 0) self.allocator.free(self.buf);
+            for (self.retired.items) |old| self.allocator.free(old);
+            self.retired.deinit(self.allocator);
             self.* = undefined;
         }
 
-        fn spinLock(self: *Self) void {
-            while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-                std.atomic.spinLoopHint();
-            }
-        }
-
-        fn spinUnlock(self: *Self) void {
-            self.lock.store(0, .release);
-        }
-
         pub fn isEmptyApprox(self: *Self) bool {
-            self.spinLock();
-            defer self.spinUnlock();
-            return self.bottom == self.top;
+            const b = self.bottom.load(.monotonic);
+            const t = self.top.load(.monotonic);
+            return t >= b;
+        }
+
+        pub fn lenApprox(self: *Self) usize {
+            const b = self.bottom.load(.monotonic);
+            const t = self.top.load(.monotonic);
+            return if (b > t) b - t else 0;
         }
 
         pub fn push(self: *Self, item: T) !void {
-            self.spinLock();
-            defer self.spinUnlock();
-            if (self.bottom - self.top == self.buf.len) {
-                try self.growUnlocked();
+            const b = self.bottom.load(.monotonic);
+            const t = self.top.load(.acquire);
+            if (b >= t and b - t >= self.buf.len) {
+                try self.grow(b, t);
             }
-            self.buf[self.bottom % self.buf.len] = item;
-            self.bottom += 1;
+            self.buf[b % self.buf.len] = item;
+            self.bottom.store(b + 1, .release);
         }
 
         pub fn pop(self: *Self) ?T {
-            self.spinLock();
-            defer self.spinUnlock();
-            if (self.bottom == self.top) return null;
-            self.bottom -= 1;
-            return self.buf[self.bottom % self.buf.len];
-        }
-
-        pub fn steal(self: *Self) ?T {
-            self.spinLock();
-            defer self.spinUnlock();
-            if (self.bottom == self.top) return null;
-            const item = self.buf[self.top % self.buf.len];
-            self.top += 1;
+            var b = self.bottom.load(.monotonic);
+            if (b == 0) return null;
+            b -= 1;
+            self.bottom.store(b, .seq_cst);
+            const t = self.top.load(.seq_cst);
+            if (t > b) {
+                self.bottom.store(t, .monotonic);
+                return null;
+            }
+            const item = self.buf[b % self.buf.len];
+            if (t == b) {
+                if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+                    self.bottom.store(t + 1, .monotonic);
+                    return null;
+                }
+                self.bottom.store(t + 1, .monotonic);
+            }
             return item;
         }
 
-        fn growUnlocked(self: *Self) !void {
-            const size = self.bottom - self.top;
-            const new_cap = if (self.buf.len == 0) 64 else self.buf.len * 2;
+        pub fn steal(self: *Self) ?T {
+            const t = self.top.load(.acquire);
+            const b = self.bottom.load(.acquire);
+            if (t >= b) return null;
+            const item = self.buf[t % self.buf.len];
+            if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+                return null;
+            }
+            return item;
+        }
+
+        fn grow(self: *Self, b: usize, t: usize) !void {
+            const size = b -% t;
+            const new_cap = self.buf.len * 2;
             const new_buf = try self.allocator.alloc(T, new_cap);
             var i: usize = 0;
             while (i < size) : (i += 1) {
-                new_buf[i] = self.buf[(self.top + i) % self.buf.len];
+                new_buf[(t + i) % new_cap] = self.buf[(t + i) % self.buf.len];
             }
-            self.allocator.free(self.buf);
+            try self.retired.append(self.allocator, self.buf);
             self.buf = new_buf;
-            self.top = 0;
-            self.bottom = size;
         }
     };
 }
@@ -92,4 +108,14 @@ test "chase-lev owner and steal" {
     try std.testing.expectEqual(@as(?u32, 1), d.steal());
     try std.testing.expectEqual(@as(?u32, 2), d.pop());
     try std.testing.expect(d.pop() == null);
+}
+
+test "chase-lev steal empty" {
+    const D = ChaseLevDeque(u32);
+    var d = try D.init(std.testing.allocator);
+    defer d.deinit();
+    try std.testing.expect(d.steal() == null);
+    try d.push(7);
+    try std.testing.expectEqual(@as(?u32, 7), d.steal());
+    try std.testing.expect(d.steal() == null);
 }

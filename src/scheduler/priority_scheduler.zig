@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const task_mod = @import("../core/task.zig");
 const context = @import("../context/context.zig");
@@ -8,6 +12,7 @@ const metrics_mod = @import("../core/metrics.zig");
 const preempt = @import("../core/preemption.zig");
 const trace = @import("../core/tracing.zig");
 const pq_mod = @import("../utils/priority_queues.zig");
+const runtime_mod = @import("../core/runtime.zig");
 
 const Task = task_mod.Task;
 
@@ -22,6 +27,7 @@ pub const PriorityScheduler = struct {
     timers: ?*timer_mod.TimerQueue = null,
     io: ?io_backend.Backend = null,
     metrics: ?*metrics_mod.Metrics = null,
+    runtime: ?*runtime_mod.Runtime = null,
 
     pub fn init(allocator: std.mem.Allocator) PriorityScheduler {
         return .{
@@ -47,6 +53,7 @@ pub const PriorityScheduler = struct {
         .yieldFromRunning = yieldV,
         .parkFromRunning = parkV,
         .finishFromRunning = finishV,
+        .handoffFromRunning = handoffV,
     };
 
     fn enqueueV(ptr: *anyopaque, t: *Task) anyerror!void {
@@ -64,6 +71,10 @@ pub const PriorityScheduler = struct {
     fn finishV(ptr: *anyopaque) void {
         const self: *PriorityScheduler = @ptrCast(@alignCast(ptr));
         self.finishFromRunning();
+    }
+    fn handoffV(ptr: *anyopaque, next: *Task) bool {
+        const self: *PriorityScheduler = @ptrCast(@alignCast(ptr));
+        return self.handoffFromRunning(next);
     }
 
     pub fn enqueue(self: *PriorityScheduler, t: *Task) !void {
@@ -85,7 +96,7 @@ pub const PriorityScheduler = struct {
         self.stopped = false;
         while (!self.stopped) {
             if (self.timers) |tq| {
-                _ = tq.fireExpired();
+                if (tq.hasDue()) _ = tq.fireExpired();
             }
 
             if (self.ready.pop()) |next| {
@@ -109,13 +120,36 @@ pub const PriorityScheduler = struct {
                     self.running = null;
                     continue;
                 }
-                context.swap(&self.sched_ctx, &next.ctx);
-                task_mod.setCurrent(null);
-                next.on_cpu.store(false, .release);
-                self.running = null;
-                if (task_mod.takeBounceAndRun(next)) {
-                    self.enqueue(next) catch @panic("zigroutines: OOM requeue after bounce");
+                var again: ?*Task = next;
+                while (again) |cur| {
+                    self.running = cur;
+                    cur.scheduled.store(false, .release);
+                    cur.state = .running;
+                    cur.on_cpu.store(true, .release);
+                    task_mod.setCurrent(cur);
+                    cur.home_worker = 0;
+                    context.swap(&self.sched_ctx, cur.ctxPtr());
+                    task_mod.setCurrent(null);
+                    cur.on_cpu.store(false, .release);
+                    self.running = null;
+                    var bounced: ?*Task = null;
+                    if (task_mod.takePendingBounce()) |b| {
+                        if (task_mod.takeBounceAndRun(b)) bounced = b;
+                    } else if (task_mod.takeBounceAndRun(cur)) {
+                        bounced = cur;
+                    }
+                    if (bounced) |b| {
+                        if (self.ready.isEmpty()) {
+                            again = b;
+                        } else {
+                            self.enqueue(b) catch @panic("zigroutines: OOM requeue after bounce");
+                            again = null;
+                        }
+                    } else {
+                        again = null;
+                    }
                 }
+                self.collectFinishedVoid();
                 continue;
             }
 
@@ -166,34 +200,65 @@ pub const PriorityScheduler = struct {
 
     pub fn yieldFromRunning(self: *PriorityScheduler) void {
         const t = self.running orelse @panic("zigroutines: yield with no running task");
+        t.checkProtect();
         if (self.metrics) |m| m.inc(.yields);
         trace.emitTask(.task_yield, t, 0);
         t.state = .ready;
         t.scheduled.store(true, .release);
         self.ready.push(t.priority, t) catch @panic("zigroutines: OOM on yield enqueue");
-        context.swap(&t.ctx, &self.sched_ctx);
+        context.swap(t.ctxPtr(), &self.sched_ctx);
     }
 
     pub fn parkFromRunning(self: *PriorityScheduler, reason: task_mod.WaitReason) void {
         const t = self.running orelse @panic("zigroutines: park with no running task");
+        t.checkProtect();
         task_mod.requireStackfulForPark();
         t.state = .blocked;
         t.blocked_on = reason;
         t.scheduled.store(false, .release);
         if (self.metrics) |m| m.inc(.parks);
+        if (reason == .worker_bounce) task_mod.noteBounce(t);
         trace.emitTask(.task_park, t, @intFromEnum(reason));
-        context.swap(&t.ctx, &self.sched_ctx);
+        context.swap(t.ctxPtr(), &self.sched_ctx);
+    }
+
+    pub fn handoffFromRunning(self: *PriorityScheduler, next: *Task) bool {
+        const t = self.running orelse return false;
+        if (next == t) return false;
+        if (next.state == .dead or next.state == .canceled) return false;
+        if (next.scheduled.swap(true, .acq_rel)) return false;
+        t.checkProtect();
+        t.state = .ready;
+        t.scheduled.store(true, .release);
+        self.ready.push(t.priority, t) catch {
+            t.scheduled.store(false, .release);
+            t.state = .running;
+            next.scheduled.store(false, .release);
+            return false;
+        };
+        self.running = next;
+        next.scheduled.store(false, .release);
+        next.state = .running;
+        next.on_cpu.store(true, .release);
+        task_mod.setCurrent(next);
+        t.on_cpu.store(false, .release);
+        context.swap(t.ctxPtr(), next.ctxPtr());
+        self.running = t;
+        t.on_cpu.store(true, .release);
+        task_mod.setCurrent(t);
+        return true;
     }
 
     pub fn finishFromRunning(self: *PriorityScheduler) void {
         const t = self.running orelse @panic("zigroutines: finish with no running task");
+        t.checkProtect();
         t.state = .dead;
         t.finished.store(true, .release);
         t.finishJoiners();
         if (self.live > 0) self.live -= 1;
         if (self.metrics) |m| m.inc(.finishes);
         trace.emitTask(.task_finish, t, 0);
-        const t_ctx = &t.ctx;
+        const t_ctx = t.ctxPtr();
         self.dead.append(self.allocator, t) catch @panic("zigroutines: OOM finishing task");
         context.swap(t_ctx, &self.sched_ctx);
     }
@@ -202,6 +267,23 @@ pub const PriorityScheduler = struct {
         while (self.dead.items.len > 0) {
             const t = self.dead.pop().?;
             t.destroy();
+        }
+    }
+
+    pub fn collectFinishedVoid(self: *PriorityScheduler) void {
+        var i: usize = 0;
+        while (i < self.dead.items.len) {
+            const t = self.dead.items[i];
+            if (t.recycled) {
+                _ = self.dead.orderedRemove(i);
+                continue;
+            }
+            if (t.result_slot == null) {
+                _ = self.dead.orderedRemove(i);
+                t.destroy();
+            } else {
+                i += 1;
+            }
         }
     }
 };

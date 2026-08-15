@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const task_mod = @import("task.zig");
 
 pub const Executor = struct {
@@ -9,6 +13,7 @@ pub const Executor = struct {
         yieldFromRunning: *const fn (ptr: *anyopaque) void,
         parkFromRunning: *const fn (ptr: *anyopaque, reason: task_mod.WaitReason) void,
         finishFromRunning: *const fn (ptr: *anyopaque) void,
+        handoffFromRunning: ?*const fn (ptr: *anyopaque, next: *task_mod.Task) bool = null,
     };
 
     pub fn enqueue(self: Executor, t: *task_mod.Task) !void {
@@ -25,5 +30,10 @@ pub const Executor = struct {
 
     pub fn finishFromRunning(self: Executor) void {
         self.vtable.finishFromRunning(self.ptr);
+    }
+
+    pub fn handoffFromRunning(self: Executor, next: *task_mod.Task) bool {
+        if (self.vtable.handoffFromRunning) |f| return f(self.ptr, next);
+        return false;
     }
 };

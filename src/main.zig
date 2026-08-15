@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 
 pub const version = Version{
@@ -42,6 +46,7 @@ pub const Version = struct {
 };
 
 pub const stack = @import("stack/stack.zig");
+pub const StackProtect = stack.StackProtect;
 pub const context = @import("context/context.zig");
 pub const task = @import("core/task.zig");
 pub const runtime = @import("core/runtime.zig");
@@ -60,6 +65,25 @@ pub const io = @import("io/io.zig");
 pub const actors = @import("actors/actor.zig");
 pub const utils = @import("utils/utils.zig");
 pub const c_bindings = @import("abi/c_bindings.zig");
+
+comptime {
+    _ = &c_bindings.zr_version_major;
+    _ = &c_bindings.zr_version_minor;
+    _ = &c_bindings.zr_version_patch;
+    _ = &c_bindings.zr_runtime_create;
+    _ = &c_bindings.zr_runtime_destroy;
+    _ = &c_bindings.zr_runtime_run;
+    _ = &c_bindings.zr_spawn;
+    _ = &c_bindings.zr_yield;
+    _ = &c_bindings.zr_sleep_ns;
+    _ = &c_bindings.zr_channel_create;
+    _ = &c_bindings.zr_channel_destroy;
+    _ = &c_bindings.zr_channel_close;
+    _ = &c_bindings.zr_channel_send;
+    _ = &c_bindings.zr_channel_recv;
+    _ = &c_bindings.zr_channel_try_send;
+    _ = &c_bindings.zr_channel_try_recv;
+}
 
 pub const cancel = cancellation;
 pub const sync = synchronization;
@@ -81,6 +105,7 @@ pub const ChannelError = channel.Error;
 pub const ChannelFullPolicy = channel.FullPolicy;
 pub const FullPolicy = channel.FullPolicy;
 pub const ChannelOptions = channel.ChannelOptions;
+pub const ChannelTopology = channel.Topology;
 pub const Context = context.Context;
 pub const JoinHandle = task.JoinHandle;
 pub const SpawnOptions = task.SpawnOptions;

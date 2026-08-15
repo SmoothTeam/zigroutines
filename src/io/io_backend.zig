@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const task_mod = @import("../core/task.zig");
 const utils = @import("../utils/utils.zig");
@@ -14,6 +18,7 @@ pub const BackendError = error{
     Unsupported,
     Closed,
     ConnectionReset,
+    WouldBlock,
     OutOfMemory,
     Unexpected,
 };
@@ -36,6 +41,7 @@ pub const Backend = struct {
         poll: *const fn (ptr: *anyopaque, timeout_ns: u64) BackendError!usize,
         associate: ?*const fn (ptr: *anyopaque, handle: Handle) BackendError!void = null,
         cancel_all: ?*const fn (ptr: *anyopaque) void = null,
+        wakeup: ?*const fn (ptr: *anyopaque) void = null,
         async_read: ?*const fn (ptr: *anyopaque, handle: Handle, buf: []u8) BackendError!usize = null,
         async_write: ?*const fn (ptr: *anyopaque, handle: Handle, buf: []const u8) BackendError!usize = null,
         supports_async: *const fn (ptr: *anyopaque) bool = supportsAsyncFalse,
@@ -63,6 +69,10 @@ pub const Backend = struct {
 
     pub fn cancelAll(self: Backend) void {
         if (self.vtable.cancel_all) |f| f(self.ptr);
+    }
+
+    pub fn wakeup(self: Backend) void {
+        if (self.vtable.wakeup) |f| f(self.ptr);
     }
 
     pub fn supportsAsync(self: Backend) bool {

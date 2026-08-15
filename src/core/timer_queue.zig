@@ -1,7 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 const task_mod = @import("task.zig");
 const sync = @import("synchronization.zig");
+const sys_posix = @import("../utils/sys_posix.zig");
 
 pub fn nowNs() i128 {
     if (comptime builtin.os.tag == .windows) {
@@ -43,19 +48,8 @@ pub fn sleepUntilDeadline(deadline_ns: i128) void {
     if (delta <= 0) return;
     const remain: u64 = @intCast(@min(@as(u64, @intCast(delta)), 50 * std.time.ns_per_ms));
     if (remain == 0) return;
-    if (comptime builtin.os.tag == .windows) {
-        const ms: u32 = @intCast(@max(remain / std.time.ns_per_ms, 1));
-        Sleep(ms);
-    } else {
-        const req = std.posix.timespec{
-            .sec = @intCast(remain / std.time.ns_per_s),
-            .nsec = @intCast(remain % std.time.ns_per_s),
-        };
-        _ = std.posix.nanosleep(&req, null);
-    }
+    sys_posix.sleepNs(remain);
 }
-
-extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 
 pub const TimerEntry = struct {
     deadline_ns: i128,
@@ -66,6 +60,7 @@ pub const TimerEntry = struct {
     heap_index: i32 = -1,
     wheel_next: ?*TimerEntry = null,
     in_wheel: bool = false,
+    wheel_slot: u32 = 0,
 };
 
 pub const TimerQueue = struct {
@@ -77,10 +72,12 @@ pub const TimerQueue = struct {
     lock: sync.SpinLock = .{},
     heap: std.ArrayListUnmanaged(*TimerEntry) = .empty,
     wheel: [wheel_slots]?*TimerEntry = @splat(null),
+    occupied: [4]u64 = @splat(0),
     wheel_base_ns: i128 = 0,
     cursor: u32 = 0,
     wheel_inited: bool = false,
     total: usize = 0,
+    next_due_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
 
     pub fn init(allocator: std.mem.Allocator) TimerQueue {
         return .{ .allocator = allocator };
@@ -108,17 +105,49 @@ pub const TimerQueue = struct {
             best = self.heap.items[0].deadline_ns;
         }
         if (self.wheel_inited) {
-            var i: u32 = 0;
-            while (i < wheel_slots) : (i += 1) {
-                const slot = (self.cursor + i) % wheel_slots;
-                if (self.wheel[slot] != null) {
-                    const cand = self.wheel_base_ns + @as(i128, i) * tick_ns;
-                    if (best == null or cand < best.?) best = cand;
-                    break;
-                }
+            if (self.nextOccupiedOff()) |off| {
+                const cand = self.wheel_base_ns + @as(i128, off) * tick_ns;
+                if (best == null or cand < best.?) best = cand;
             }
         }
         return best;
+    }
+
+    pub fn hasDue(self: *const TimerQueue) bool {
+        const due = self.next_due_ns.load(.monotonic);
+        if (due == std.math.maxInt(i64)) return false;
+        return nowNs() >= due;
+    }
+
+    fn publishDue(self: *TimerQueue) void {
+        var best: i128 = std.math.maxInt(i64);
+        if (self.heap.items.len > 0) {
+            best = self.heap.items[0].deadline_ns;
+        }
+        if (self.wheel_inited) {
+            if (self.nextOccupiedOff()) |off| {
+                const cand = self.wheel_base_ns + @as(i128, off) * tick_ns;
+                if (cand < best) best = cand;
+            }
+        }
+        const clamped: i64 = if (best >= std.math.maxInt(i64))
+            std.math.maxInt(i64)
+        else
+            @intCast(best);
+        self.next_due_ns.store(clamped, .release);
+    }
+
+    fn noteSooner(self: *TimerQueue, deadline_ns: i128) void {
+        if (deadline_ns >= std.math.maxInt(i64)) return;
+        const d: i64 = @intCast(deadline_ns);
+        var cur = self.next_due_ns.load(.monotonic);
+        while (d < cur) {
+            if (self.next_due_ns.cmpxchgWeak(cur, d, .release, .monotonic)) |now| {
+                cur = now;
+            } else {
+                return;
+            }
+        }
     }
 
     pub fn add(self: *TimerQueue, entry: *TimerEntry) void {
@@ -142,16 +171,68 @@ pub const TimerQueue = struct {
         if (delta < horizon_ns and entry.deadline_ns >= self.wheel_base_ns) {
             const ticks_from_base = @divTrunc(entry.deadline_ns - self.wheel_base_ns, tick_ns);
             const slot = wheelSlot(self.cursor, ticks_from_base);
+            entry.wheel_slot = @intCast(slot);
             entry.wheel_next = self.wheel[slot];
             self.wheel[slot] = entry;
             entry.in_wheel = true;
+            self.markOccupied(slot);
             self.total += 1;
+            self.noteSooner(entry.deadline_ns);
             return;
         }
 
         self.heap.append(self.allocator, entry) catch @panic("zigroutines: OOM timer heap");
         self.siftUp(self.heap.items.len - 1);
         self.total += 1;
+        self.noteSooner(entry.deadline_ns);
+    }
+
+    fn markOccupied(self: *TimerQueue, slot: usize) void {
+        const word = slot / 64;
+        const bit: u6 = @intCast(slot % 64);
+        self.occupied[word] |= @as(u64, 1) << bit;
+    }
+
+    fn refreshOccupied(self: *TimerQueue, slot: usize) void {
+        const word = slot / 64;
+        const bit: u6 = @intCast(slot % 64);
+        if (self.wheel[slot] == null) {
+            self.occupied[word] &= ~(@as(u64, 1) << bit);
+        } else {
+            self.occupied[word] |= @as(u64, 1) << bit;
+        }
+    }
+
+    fn nextOccupiedOff(self: *const TimerQueue) ?u32 {
+        const c: u32 = self.cursor;
+        const first_word = c / 64;
+        const first_bit: u6 = @intCast(c % 64);
+        const first_mask = self.occupied[first_word] & ~((@as(u64, 1) << first_bit) -% 1);
+        if (first_mask != 0) {
+            return first_word * 64 + @ctz(first_mask) - c;
+        }
+
+        var w: u32 = first_word + 1;
+        while (w < 4) : (w += 1) {
+            if (self.occupied[w] != 0) {
+                return w * 64 + @ctz(self.occupied[w]) - c;
+            }
+        }
+
+        w = 0;
+        while (w < first_word) : (w += 1) {
+            if (self.occupied[w] != 0) {
+                return w * 64 + @ctz(self.occupied[w]) + 256 - c;
+            }
+        }
+
+        if (first_bit != 0) {
+            const wrap_mask = self.occupied[first_word] & ((@as(u64, 1) << first_bit) -% 1);
+            if (wrap_mask != 0) {
+                return first_word * 64 + @ctz(wrap_mask) + 256 - c;
+            }
+        }
+        return null;
     }
 
     fn wheelSlot(cursor: u32, ticks_from_base: i128) usize {
@@ -164,6 +245,7 @@ pub const TimerQueue = struct {
         self.lock.lock();
         defer self.lock.unlock();
         self.removeUnlocked(entry);
+        self.publishDue();
     }
 
     fn removeUnlocked(self: *TimerQueue, entry: *TimerEntry) void {
@@ -189,24 +271,23 @@ pub const TimerQueue = struct {
     }
 
     fn removeFromWheel(self: *TimerQueue, entry: *TimerEntry) void {
-        var s: usize = 0;
-        while (s < wheel_slots) : (s += 1) {
-            var prev: ?*TimerEntry = null;
-            var cur = self.wheel[s];
-            while (cur) |c| {
-                if (c == entry) {
-                    if (prev) |p| {
-                        p.wheel_next = c.wheel_next;
-                    } else {
-                        self.wheel[s] = c.wheel_next;
-                    }
-                    entry.wheel_next = null;
-                    entry.in_wheel = false;
-                    return;
+        const s: usize = @min(@as(usize, entry.wheel_slot), wheel_slots - 1);
+        var prev: ?*TimerEntry = null;
+        var cur = self.wheel[s];
+        while (cur) |c| {
+            if (c == entry) {
+                if (prev) |p| {
+                    p.wheel_next = c.wheel_next;
+                } else {
+                    self.wheel[s] = c.wheel_next;
                 }
-                prev = c;
-                cur = c.wheel_next;
+                entry.wheel_next = null;
+                entry.in_wheel = false;
+                self.refreshOccupied(s);
+                return;
             }
+            prev = c;
+            cur = c.wheel_next;
         }
         entry.in_wheel = false;
         entry.wheel_next = null;
@@ -214,17 +295,38 @@ pub const TimerQueue = struct {
 
     pub fn fireExpired(self: *TimerQueue) usize {
         const now = nowNs();
-        var stack_wake: [128]*task_mod.Task = undefined;
+        var stack_wake: [256]*task_mod.Task = undefined;
         var n_stack: usize = 0;
         var heap_wake: std.ArrayListUnmanaged(*task_mod.Task) = .empty;
         defer heap_wake.deinit(self.allocator);
 
         self.lock.lock();
+        if (self.total > stack_wake.len) {
+            heap_wake.ensureTotalCapacity(self.allocator, self.total) catch {};
+        }
 
         if (self.wheel_inited) {
             while (self.wheel_base_ns + tick_ns <= now) {
+                if (self.wheel[self.cursor] == null) {
+                    const ticks_avail: i128 = @divTrunc(now - self.wheel_base_ns, tick_ns);
+                    if (self.nextOccupiedOff()) |off| {
+                        if (off > 0) {
+                            const jump: i128 = @min(@as(i128, off), ticks_avail);
+                            if (jump > 0) {
+                                self.cursor = @intCast(@mod(@as(i128, self.cursor) + jump, @as(i128, wheel_slots)));
+                                self.wheel_base_ns += jump * tick_ns;
+                                continue;
+                            }
+                        }
+                    } else if (ticks_avail > 0) {
+                        self.cursor = @intCast(@mod(@as(i128, self.cursor) + ticks_avail, @as(i128, wheel_slots)));
+                        self.wheel_base_ns += ticks_avail * tick_ns;
+                        break;
+                    }
+                }
                 var cur = self.wheel[self.cursor];
                 self.wheel[self.cursor] = null;
+                self.refreshOccupied(self.cursor);
                 while (cur) |entry| {
                     const next = entry.wheel_next;
                     entry.wheel_next = null;
@@ -258,6 +360,7 @@ pub const TimerQueue = struct {
                     if (prev) |p| p.wheel_next = next else self.wheel[self.cursor] = next;
                     entry.wheel_next = null;
                     entry.in_wheel = false;
+                    self.refreshOccupied(self.cursor);
                     if (self.total > 0) self.total -= 1;
                     entry.done = true;
                     if (entry.parked) {
@@ -275,6 +378,7 @@ pub const TimerQueue = struct {
                     if (prev) |p| p.wheel_next = next else self.wheel[self.cursor] = next;
                     entry.wheel_next = null;
                     entry.in_wheel = false;
+                    self.refreshOccupied(self.cursor);
                     if (self.total > 0) self.total -= 1;
                     entry.done = true;
                     cur = next;
@@ -304,6 +408,7 @@ pub const TimerQueue = struct {
         }
 
         self.promoteHeapToWheel(now);
+        self.publishDue();
 
         self.lock.unlock();
 
@@ -329,9 +434,11 @@ pub const TimerQueue = struct {
         if (delta < horizon_ns and entry.deadline_ns >= self.wheel_base_ns) {
             const ticks_from_base = @divTrunc(entry.deadline_ns - self.wheel_base_ns, tick_ns);
             const slot = wheelSlot(self.cursor, ticks_from_base);
+            entry.wheel_slot = @intCast(slot);
             entry.wheel_next = self.wheel[slot];
             self.wheel[slot] = entry;
             entry.in_wheel = true;
+            self.markOccupied(slot);
             self.total += 1;
             return;
         }
@@ -367,12 +474,24 @@ pub const TimerQueue = struct {
     }
 
     pub fn sleep(self: *TimerQueue, duration_ns: u64) void {
+        const deadline = nowNs() + @as(i128, @intCast(duration_ns));
+
+        if (duration_ns < tick_ns) {
+            while (nowNs() < deadline) {
+                task_mod.yield();
+            }
+            return;
+        }
         const me = task_mod.current() orelse @panic("zigroutines: sleep outside a task");
         var entry = TimerEntry{
-            .deadline_ns = nowNs() + @as(i128, @intCast(duration_ns)),
+            .deadline_ns = deadline,
             .task = me,
         };
         self.add(&entry);
+        if (entry.done or nowNs() >= deadline) {
+            self.remove(&entry);
+            return;
+        }
         self.wait(&entry);
         self.remove(&entry);
     }
@@ -414,7 +533,5 @@ pub const TimerQueue = struct {
 };
 
 fn wakeTask(t: *task_mod.Task) void {
-    task_mod.waitUntilOffCpu(t);
-    const ex = t.executor orelse @panic("zigroutines: wake timer task without executor");
-    ex.enqueue(t) catch @panic("zigroutines: OOM waking timer");
+    task_mod.wakeTask(t);
 }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const runtime_mod = @import("../core/runtime.zig");
 const task_mod = @import("../core/task.zig");
@@ -111,7 +115,11 @@ fn vConcurrent(
         start,
     ) catch return error.ConcurrencyUnavailable;
 
-    const handle = self.runtime.spawn(.{}, futureTask, .{f}) catch {
+    const handle = task_mod.callOnWorkerStack(struct {
+        fn go(r: *runtime_mod.Runtime, fut: *FutureState) !task_mod.JoinHandle {
+            return r.spawn(.{}, futureTask, .{fut});
+        }
+    }.go, .{ self.runtime, f }) catch {
         f.destroy();
         return error.ConcurrencyUnavailable;
     };
@@ -182,7 +190,11 @@ fn spawnFuture(
     );
     errdefer f.destroy();
 
-    const handle = try self.runtime.spawn(.{}, futureTask, .{f});
+    const handle = try task_mod.callOnWorkerStack(struct {
+        fn go(r: *runtime_mod.Runtime, fut: *FutureState) !task_mod.JoinHandle {
+            return r.spawn(.{}, futureTask, .{fut});
+        }
+    }.go, .{ self.runtime, f });
     f.join = handle;
     self.track(f);
 

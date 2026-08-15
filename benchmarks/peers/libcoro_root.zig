@@ -1,5 +1,5 @@
-const coro = @import("deps/zigcoro/src/coro.zig");
-const executor = @import("deps/zigcoro/src/executor.zig");
+const coro = @import(".peer-src/zigcoro/src/coro.zig");
+const executor = @import(".peer-src/zigcoro/src/executor.zig");
 
 pub const Error = coro.Error;
 pub const StackT = coro.StackT;

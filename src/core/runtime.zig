@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const stack_mod = @import("../stack/stack.zig");
 const fifo_mod = @import("../scheduler/fifo_scheduler.zig");
@@ -29,6 +33,7 @@ pub const Config = struct {
     policy: SchedulerPolicy = .auto,
     stack_pool: bool = true,
     task_freelist: bool = true,
+    stack_protect: stack_mod.StackProtect = .none,
     stack_guard_page: bool = false,
     stack_paint_canary: bool = false,
     io: IoConfig = .none,
@@ -54,6 +59,16 @@ threadlocal var tls_runtime: ?*Runtime = null;
 
 pub fn currentRuntime() ?*Runtime {
     return tls_runtime;
+}
+
+pub fn enter(self: *Runtime) ?*Runtime {
+    const prev = tls_runtime;
+    tls_runtime = self;
+    return prev;
+}
+
+pub fn leave(prev: ?*Runtime) void {
+    tls_runtime = prev;
 }
 
 pub const Runtime = struct {
@@ -93,10 +108,11 @@ pub const Runtime = struct {
             workers = cpu_count;
         }
 
+        const protect = resolvedProtect(config);
         var pool: ?stack_mod.Pool = null;
-        if (config.stack_pool) {
+        if (config.stack_pool or protect == .guard) {
             pool = stack_mod.Pool.initWith(allocator, .{
-                .guard_page = config.stack_guard_page,
+                .protect = protect,
                 .paint_canary = config.stack_paint_canary,
             });
         }
@@ -175,21 +191,25 @@ pub const Runtime = struct {
                 f.timers = &self.timers;
                 f.io = self.io;
                 f.metrics = &self.metrics;
+                f.runtime = self;
             },
             .work_stealing => |*ws| {
                 ws.timers = &self.timers;
                 ws.io = self.io;
                 ws.metrics = &self.metrics;
+                ws.runtime = self;
             },
             .priority => |*p| {
                 p.timers = &self.timers;
                 p.io = self.io;
                 p.metrics = &self.metrics;
+                p.runtime = self;
             },
             .thread_per_task => |*t| {
                 t.timers = &self.timers;
                 t.io = self.io;
                 t.metrics = &self.metrics;
+                t.runtime = self;
             },
         }
     }
@@ -255,6 +275,8 @@ pub const Runtime = struct {
 
     fn prepareSpawnOpts(self: *Runtime, opts: task_mod.SpawnOptions) task_mod.SpawnOptions {
         var spawn_opts = opts;
+        const protect = resolvedProtect(self.config);
+        if (spawn_opts.protect == .none) spawn_opts.protect = protect;
         if (self.config.stack_guard_page) spawn_opts.guard_page = true;
         if (self.config.stack_paint_canary) spawn_opts.paint_canary = true;
         return spawn_opts;
@@ -270,6 +292,10 @@ pub const Runtime = struct {
         self.metrics.inc(.spawns);
     }
 
+    pub fn channel(self: *Runtime, comptime T: type, capacity: usize) !*@import("../csp/channel.zig").Channel(T) {
+        return @import("../csp/channel.zig").Channel(T).createWith(self.allocator, capacity, .{ .recycle = true });
+    }
+
     pub fn spawn(
         self: *Runtime,
         opts: task_mod.SpawnOptions,
@@ -279,7 +305,11 @@ pub const Runtime = struct {
         const spawn_opts = self.prepareSpawnOpts(opts);
         self.noteSpawn();
         trace.emit(.task_spawn, 0);
-        return task_mod.spawnOnEnv(self.spawnEnv(), spawn_opts, func, args);
+        return task_mod.callOnWorkerStack(struct {
+            fn go(rt: *Runtime, so: task_mod.SpawnOptions, a: std.meta.ArgsTuple(@TypeOf(func))) !task_mod.JoinHandle {
+                return task_mod.spawnOnEnv(rt.spawnEnv(), so, func, a);
+            }
+        }.go, .{ self, spawn_opts, args });
     }
 
     pub fn spawnLeaf(
@@ -292,7 +322,11 @@ pub const Runtime = struct {
         spawn_opts.mode = .leaf;
         self.noteSpawn();
         trace.emit(.task_spawn, 2);
-        return task_mod.spawnOnEnv(self.spawnEnv(), spawn_opts, func, args);
+        return task_mod.callOnWorkerStack(struct {
+            fn go(rt: *Runtime, so: task_mod.SpawnOptions, a: std.meta.ArgsTuple(@TypeOf(func))) !task_mod.JoinHandle {
+                return task_mod.spawnOnEnv(rt.spawnEnv(), so, func, a);
+            }
+        }.go, .{ self, spawn_opts, args });
     }
 
     pub fn spawnResult(
@@ -304,15 +338,18 @@ pub const Runtime = struct {
         const spawn_opts = self.prepareSpawnOpts(opts);
         self.noteSpawn();
         trace.emit(.task_spawn, 1);
-        return task_mod.spawnOnResultEnv(self.spawnEnv(), spawn_opts, func, args);
+        return task_mod.callOnWorkerStack(struct {
+            fn go(rt: *Runtime, so: task_mod.SpawnOptions, a: std.meta.ArgsTuple(@TypeOf(func))) !task_mod.TypedJoinHandle(task_mod.ResultTypeOfPublic(func)) {
+                return task_mod.spawnOnResultEnv(rt.spawnEnv(), so, func, a);
+            }
+        }.go, .{ self, spawn_opts, args });
     }
 
     pub fn run(self: *Runtime) !void {
         self.bindShared();
         preempt.bind(self.config.preempt);
-        const prev = tls_runtime;
-        tls_runtime = self;
-        defer tls_runtime = prev;
+        const prev = enter(self);
+        defer leave(prev);
 
         switch (self.backend) {
             .fifo => |*f| f.run(),
@@ -340,4 +377,10 @@ pub const Runtime = struct {
 pub fn sleep(duration_ns: u64) void {
     const rt = tls_runtime orelse @panic("zigroutines: sleep without current runtime");
     rt.sleep(duration_ns);
+}
+
+fn resolvedProtect(config: Config) stack_mod.StackProtect {
+    if (config.stack_protect != .none) return config.stack_protect;
+    if (config.stack_guard_page) return .guard;
+    return .none;
 }

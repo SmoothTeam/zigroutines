@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 fn print_rate(name: &str, ops: usize, dt: Duration) {
@@ -21,9 +23,15 @@ fn print_rate(name: &str, ops: usize, dt: Duration) {
     );
 }
 
+fn worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(worker_threads())
         .enable_all()
         .build()
         .unwrap()
@@ -31,14 +39,17 @@ fn rt() -> tokio::runtime::Runtime {
 
 fn main() {
     println!(
-        "rust bench  rustc={}  tokio multi-thread",
-        rustc_version_runtime()
+        "rust bench  rustc={}  tokio multi-thread workers={}",
+        rustc_version_runtime(),
+        worker_threads()
     );
 
     println!("--- fiber / spawn ---");
+    bench_ctx_switch_bounce();
     bench_yield_pingpong();
     bench_yield_single();
     bench_yield_ws4();
+    bench_leaf_spawn();
     bench_spawn_join();
     bench_spawn_result_join();
     bench_nursery_join();
@@ -75,17 +86,59 @@ fn main() {
     bench_timer_sleep_batch();
     bench_many_timers();
 
+    println!("--- io ---");
+    bench_tcp_pingpong();
+    bench_udp_ping();
+
     println!("---");
     println!("done");
 }
 
-fn rustc_version_runtime() -> String {
-    option_env!("CARGO_PKG_RUST_VERSION")
-        .unwrap_or("stable")
-        .to_string()
+fn rustc_version_runtime() -> &'static str {
+    option_env!("RUSTC_VERSION").unwrap_or("unknown")
 }
 
 // fiber/spawn
+
+fn bench_ctx_switch_bounce() {
+    let n = 400_000usize;
+    let runtime = rt();
+    let t0 = Instant::now();
+    runtime.block_on(async {
+        let ping = Arc::new(tokio::sync::Notify::new());
+        let pong = Arc::new(tokio::sync::Notify::new());
+        let ping_b = ping.clone();
+        let pong_b = pong.clone();
+        let h = tokio::spawn(async move {
+            for _ in 0..n {
+                ping_b.notified().await;
+                pong_b.notify_one();
+            }
+        });
+        for _ in 0..n {
+            ping.notify_one();
+            pong.notified().await;
+        }
+        h.await.unwrap();
+    });
+    print_rate("ctx_switch_bounce", n * 2, t0.elapsed());
+}
+
+fn bench_leaf_spawn() {
+    let n = 50_000usize;
+    let runtime = rt();
+    let t0 = Instant::now();
+    runtime.block_on(async {
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            handles.push(tokio::spawn(async {}));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    });
+    print_rate("leaf_spawn_batch", n, t0.elapsed());
+}
 
 fn bench_yield_pingpong() {
     let n = 200_000usize;
@@ -226,24 +279,29 @@ fn bench_priority_dispatch() {
     print_rate("priority_dispatch", n, t0.elapsed());
 }
 
-fn skynet(num: usize, size: usize) -> usize {
-    if size == 1 {
-        return num;
+fn skynet(num: usize, size: usize) -> impl std::future::Future<Output = usize> + Send {
+    async move {
+        if size == 1 {
+            return num;
+        }
+        let next = size / 10;
+        let mut handles = Vec::with_capacity(10);
+        for i in 0..10 {
+            handles.push(tokio::spawn(skynet(num + i * next, next)));
+        }
+        let mut sum = 0usize;
+        for h in handles {
+            sum = sum.wrapping_add(h.await.unwrap());
+        }
+        sum
     }
-    let div = 10;
-    let next = size / div;
-    let mut handles = Vec::with_capacity(div);
-    for i in 0..div {
-        let n0 = num + i * next;
-        handles.push(thread::spawn(move || skynet(n0, next)));
-    }
-    handles.into_iter().map(|h| h.join().unwrap()).sum()
 }
 
 fn bench_skynet() {
     let size = 10_000usize;
+    let runtime = rt();
     let t0 = Instant::now();
-    let _ = skynet(0, size);
+    let _ = runtime.block_on(skynet(0, size));
     let total = size + size / 10 + size / 100 + size / 1000 + size / 10_000;
     print_rate("skynet_join_10k", total, t0.elapsed());
 }
@@ -692,4 +750,102 @@ fn bench_many_timers() {
         }
     });
     print_rate("timer_many_100k_dispatch", n, t0.elapsed());
+}
+
+fn bench_tcp_pingpong() {
+    let rounds = 20_000usize;
+    let runtime = rt();
+    let t0 = Instant::now();
+    let completed = runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = sock.set_nodelay(true);
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        let msg = b"PING\n";
+        let mut buf = [0u8; 5];
+        let mut done = 0usize;
+        for _ in 0..rounds {
+            if client.write_all(msg).await.is_err() {
+                break;
+            }
+            if client.read_exact(&mut buf).await.is_err() {
+                break;
+            }
+            done += 1;
+        }
+        drop(client);
+        let _ = server.await;
+        done
+    });
+    let dt = t0.elapsed();
+    if completed == 0 {
+        println!("tcp_pingpong: failed (0 roundtrips)");
+        return;
+    }
+    let per_s = completed as f64 / dt.as_secs_f64();
+    println!(
+        "tcp_pingpong: {completed} roundtrips in {:.3} ms → {:.0} roundtrips/s",
+        dt.as_secs_f64() * 1e3,
+        per_s
+    );
+    print_rate("tcp_pingpong_latency", completed, dt);
+}
+
+fn bench_udp_ping() {
+    let rounds = 10_000usize;
+    let runtime = rt();
+    let t0 = Instant::now();
+    let completed = runtime.block_on(async {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 32];
+            for _ in 0..rounds {
+                match tokio::time::timeout(Duration::from_millis(250), server.recv_from(&mut buf))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = b"PING";
+        let mut done = 0usize;
+        for _ in 0..rounds {
+            if client.send_to(payload, addr).await.is_err() {
+                break;
+            }
+            done += 1;
+        }
+        let _ = srv.await;
+        done
+    });
+    let dt = t0.elapsed();
+    if completed == 0 {
+        println!("udp_ping: failed (0 packets)");
+        return;
+    }
+    let per_s = completed as f64 / dt.as_secs_f64();
+    println!(
+        "udp_ping: {completed} pkts in {:.3} ms → {:.0} pkts/s",
+        dt.as_secs_f64() * 1e3,
+        per_s
+    );
+    print_rate("udp_ping_latency", completed, dt);
 }

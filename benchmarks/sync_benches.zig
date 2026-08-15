@@ -8,6 +8,7 @@ pub fn runAll(alloc: std.mem.Allocator) !void {
     try semaphoreHandoff(alloc);
     try rwlockShared(alloc);
     try rwlockExclusive(alloc);
+    try rateLimiterTry(alloc);
 }
 
 fn mutexUncontended(alloc: std.mem.Allocator) !void {
@@ -160,4 +161,28 @@ fn rwlockExclusive(alloc: std.mem.Allocator) !void {
     try rt.run();
     const t1 = common.nowNs();
     common.printRate("rwlock_exclusive", n, t1 - t0);
+}
+
+fn rateLimiterTry(alloc: std.mem.Allocator) !void {
+    const n: usize = 200_000;
+    var rt = try zr.Runtime.init(alloc, .{ .workers = 1, .stack_pool = true });
+    defer rt.deinit();
+
+    var limiter = zr.RateLimiter.init(alloc, 1e12, 1.0e9);
+    defer limiter.deinit();
+
+    const S = struct {
+        fn work(l: *zr.RateLimiter, count: usize) void {
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                std.mem.doNotOptimizeAway(l.tryAcquire());
+            }
+        }
+    };
+    _ = try rt.spawn(.{}, S.work, .{ &limiter, n });
+
+    const t0 = common.nowNs();
+    try rt.run();
+    const t1 = common.nowNs();
+    common.printRate("rate_limiter_try", n, t1 - t0);
 }

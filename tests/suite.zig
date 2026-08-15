@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const zr = @import("zigroutines");
 
@@ -7,8 +11,9 @@ test "version is 1.0.x" {
 }
 
 test {
-    // Utils / foundation
+    // Utils/foundation
     _ = @import("zigroutines").utils;
+    _ = @import("zigroutines").timer_queue;
 
     // Unit
     _ = @import("unit/stack_pool.zig");
@@ -19,7 +24,9 @@ test {
     _ = @import("unit/stack_guard_and_canary.zig");
     _ = @import("unit/synchronization.zig");
     _ = @import("unit/rwlock_exclusive.zig");
+    _ = @import("unit/timer_queue.zig");
     _ = @import("unit/actor_lifecycle.zig");
+    _ = @import("abi/c_abi.zig");
 
     // Integration
     _ = @import("integration/context_switch.zig");

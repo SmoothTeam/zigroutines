@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const channel_mod = @import("../csp/channel.zig");
 const task_mod = @import("../core/task.zig");
@@ -114,10 +118,14 @@ pub fn Actor(comptime Message: type) type {
         pub fn destroy(self: *Self) void {
             self.cancel();
             self.join();
-            self.mailbox.destroy();
-            self.token.deinit();
-            const allocator = self.allocator;
-            allocator.destroy(self);
+            const Impl = struct {
+                fn free(a: *Self) void {
+                    a.mailbox.destroy();
+                    a.token.deinit();
+                    a.allocator.destroy(a);
+                }
+            };
+            task_mod.callOnWorkerStack(Impl.free, .{self});
         }
     };
 }

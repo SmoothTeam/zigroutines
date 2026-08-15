@@ -1,22 +1,28 @@
+<!--
+SPDX-FileCopyrightText: 2026 Apanazar
+
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
+
 # zigroutines
-
-zigroutines — explicit **stackful M:N** concurrency for Zig: Go-shaped tasks, channels, and `select`, with a Runtime you construct yourself.
-
 
 | | |
 |--|--|
-| **Version** | **1.0.0** (`build.zig.zon` · `zr.version`) |
+| **Version** | **1.0.0** |
 | **License** | **LGPL-3.0-or-later** ([LICENSE](LICENSE)) |
-| **Platforms** | **x86_64 / aarch64** · Windows, Linux, macOS, FreeBSD |
-| **Zig** | **0.16** and **0.17-dev** |
+| **Platforms** | **x86_64/aarch64**;  Windows, Linux, macOS, FreeBSD |
+| **Zig** | **0.17-dev.1503+** |
 
 ```bash
-zig build test
-zig build bench
+zig build test -Doptimize=ReleaseSafe
+zig build c-abi-test -Doptimize=ReleaseSafe
+zig build bench -Doptimize=ReleaseFast
 zig build run
 zig build examples
 zig build example -Dexample=01_minimal_spawn
 ```
+
+`zig build` also installs the static C library (`libzigroutines/zigroutines.lib`) and `include/zigroutines.h`.
 
 ---
 
@@ -26,7 +32,7 @@ zig build example -Dexample=01_minimal_spawn
 
 **zigroutines** is a library for **explicit stackful concurrency** in Zig. It gives you a Go-shaped model (tasks, channels, `select`, cancellation, timers) with Zig’s philosophy: **nothing global, nothing hidden, pay only for what you enable**.
 
-Unlike a “runtime baked into the language,” **you construct** a `Runtime`, choose the scheduler policy, I/O backend, and metrics. Stacks are **fixed 2 KiB** (no growth, no per-task dial). No GC. No netpoller until you plug one in.
+Unlike a "runtime baked into the language", **you construct** a `Runtime`, choose the scheduler policy, I/O backend, and metrics. Stacks are **fixed 2 KiB** (no growth, no per-task dial). No GC. No netpoller until you plug one in.
 
 At a glance:
 
@@ -39,13 +45,13 @@ At a glance:
 | I/O | Plugin: `none` / `poll` / `iocp` / `io_uring` |
 | Synchronization | Mutex (adaptive), Semaphore, RwLock, RateLimiter, **Notify**, **Watch(T)** — park the **task**, not the OS thread |
 | Timers | Hierarchical **wheel** (256×1 ms) + heap overflow |
-| Cost | Pay-for-what-you-use; stack pool + task freelist on; channel `createPooled` for hot create |
+| Cost | Pay-for-what-you-use; stack pool + task freelist on; in-stack spawn args/result; channel `createPooled` for hot create |
 
 ### 1.2. What it gives Zig developers
 
 1. **Write top-down “sync-looking” code** — `send` / `recv` / `sleep` / `yield` look like ordinary calls; under the hood the task parks and yields the CPU to other fibers. No function coloring (`async`/`await` does not infect the call tree).
 
-2. **Predictable resources** — every fiber has a **fixed 2 KiB** stack (no size dial). Heavy buffers go on the heap. Stack pool on by default. Optional guard page / canary.
+2. **Predictable resources** — every fiber has a **fixed 2 KiB** stack (no size dial). Heavy buffers go on the heap. Stack pool on by default. Overflow policy is opt-in (`none` / `canary` / `guard`); guard pages share a reserved arena so they do not cost 8 KiB committed + one VMA per task.
 
 3. **Swap scheduling policy without changing the API** — the same `spawn` works on FIFO (1 worker), work-stealing (many cores), priority, and thread-per-task.
 
@@ -87,14 +93,15 @@ At a glance:
 
 Go wins “ship a service in an afternoon.” zigroutines wins when you **cannot** accept GC, silent stack growth, or an immovable runtime. C++ can match the control if you are an expert and assemble the stack yourself. Tokio is world-class for Rust; on **Zig**, zigroutines keeps the mental model “task + stack + channel” without async coloring.
 
+The Zig-library table above is a glance. **5.3** is why a nanosecond in 5.2 is not a product verdict: zigcoro, zio, and libxev are different machines, and a cell we lose is usually a constraint they do not have.
+
 ### 1.4. Why choose this
 
 1. **One coherent surface** — scheduler, I/O, cancel, CSP, stacks, metrics: policies you enable, not a hidden runtime.
 2. **Honest to Zig** — no process-global runtime, no GC, no silent growth; pay only for enabled features.
 3. **Go-shaped DX** — write top-down; park on channels/timers/I/O without rewriting the call tree.
-4. **Measurable cost** — fixed stacks, optional metrics/canary, explicit park/wake rules.
+4. **Measurable cost** — fixed stacks, context saved on the fiber stack (not in the TCB), optional metrics/canary, explicit park/wake rules.
 
-**Not** the best choice for “absolute max pps on one echo path” (a specialized loop may win) or full BEAM/OTP-style supervision. **Best** choice for **one** concurrency stack on Zig that does not betray the language.
 
 ### 1.5. How to depend on it in your project
 
@@ -180,13 +187,13 @@ try rt.run();
                        + pool
 ```
 
-**Defaults:** 1 worker · FIFO · **fixed 2 KiB** stacks · stack pool on · task freelist on · I/O off · metrics off · preemption off. (Channel recycle is opt-in via `createPooled` so test allocators stay leak-free.)
+**Defaults:** 1 worker · FIFO · **fixed 2 KiB** stacks · stack pool on · task freelist on · `stack_protect = .none` · I/O off · metrics off · preemption off. (Channel recycle is opt-in via `createPooled` so test allocators stay leak-free.)
 
 ### 2.2. Layers and control flow
 
 1. **Application layer** — your functions invoked via `Runtime.spawn` / `spawnResult` / `Nursery.spawn` / `Actor`.
 2. **CSP / sync** — `Channel`, `select`, Mutex/Semaphore/…: on block, call `parkFromRunning` on the current executor.
-3. **Task** — unit of execution: id, state, fixed stack, context (registers), join-waiters, optional result slot.
+3. **Task** — unit of execution: id, state, fixed stack, context saved **on the fiber stack**, join-waiters, optional result slot (also on the stack when it fits).
 4. **Scheduler backend** — ready queue, worker↔task context swap, live/dead accounting, timer/I/O poll in idle.
 5. **Runtime** — facade: config, backend creation, stack pool, timer queue, I/O ownership, TLS “current runtime”.
 6. **Context / arch** — assembly stack switch (x86_64 / aarch64).
@@ -207,7 +214,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 | **Executor** | VTable: enqueue, yield, park, finish | `src/core/executor.zig` |
 | **yield / current / sleep** | Cooperative CPU yield; TLS current task; sleep via timers | `task.zig`, `runtime.zig` |
 
-**Rules:** `yield` / `channel` / `sync` are allowed **only inside a task**. Outside a task — panic with a clear message. `sleep` requires a TLS runtime (set by `run`).
+**Rules:** `yield` / `channel` / `sync` are allowed **only inside a task**. Outside a task — panic with a clear message. `sleep` requires a TLS runtime (set by `run`). `Runtime.spawn` / `spawnResult` from a fiber bounce onto the worker stack (2 KiB is not enough for the spawn path).
 
 #### 2.3.2. Schedulers (policies)
 
@@ -225,18 +232,20 @@ Below is a full catalog of “what exists in the system” and **where the code 
 
 | Mechanism | Role | Files |
 |-----------|------|--------|
-| **Stack** | Fixed buffer; usable region | `src/stack/stack.zig` |
-| **Pool** | Size-class reuse across tasks | `stack.zig` |
-| **guard_page** | PROT_NONE / PAGE_NOACCESS under the stack → fault on overflow | `stack.zig` |
-| **paint_canary** | Pattern fill; `highWaterUsed()` | `stack.zig` |
+| **Stack** | Fixed 2 KiB usable region | `src/stack/stack.zig` |
+| **Pool slot** | `[2 KiB usable \| 512 B TCB]`; TCB sits *above* the stack so frames cannot smash it | `stack.zig`, `task.zig` |
+| **Pool** | Reuse; heap class for `none`/`canary`, arena slots for `guard` | `stack.zig` |
+| **`StackProtect.none`** | Default: no extra RSS, no check | `stack.zig` |
+| **`StackProtect.canary`** | Opt-in 16-byte cookie; checked on yield/park/finish | `stack.zig` |
+| **`StackProtect.guard`** | Opt-in OS fault via a reserved arena (not one mmap per task) | `stack.zig` |
+| **paint_canary** | Full pattern fill; `highWaterUsed()` (word scan) | `stack.zig` |
 
-**Rule:** the stack **does not grow** and **is not sized per task** — every stackful fiber is **`fiber_stack_size` (2 KiB)**. Overflow is a guard-page fault (if enabled) or silent corruption. Keep deep frames and large buffers on the heap; use `spawnLeaf` for run-to-completion work with no private stack.
 
 #### 2.3.4. Context switch
 
 | Entity | Role | Files |
 |--------|------|--------|
-| **Context** | Saved registers + entry trampoline | `src/context/context.zig` |
+| **Context** | Saved registers; stored at the **top** of the fiber stack (TCB holds a pointer) | `src/context/context.zig`, `src/core/task.zig` |
 | **x86_64 / aarch64 asm** | `make` / `swap` | `src/context/arch/x86_64_assembly.zig`, `aarch64_assembly.zig` |
 | **supported** | comptime flag for the target platform | `context.zig` |
 
@@ -244,7 +253,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 
 | Entity | Role | Files |
 |--------|------|--------|
-| **Channel(T)** | Buffered or rendezvous (capacity 0); MPMC | `src/csp/channel.zig` |
+| **Channel(T)** | Buffered or rendezvous (capacity 0); MPMC seq-slot ring (lock only for waiters); optional `spsc`/`mpsc` topology | `src/csp/channel.zig` |
 | **FullPolicy** | `block` · `drop_newest` · `drop_oldest` · `error_full` | `channel.zig` |
 | **send / recv / try\*** | Blocking and non-blocking ops | `channel.zig` |
 | **select.multi / recv / recvAny** | Up to 32 recv + 32 send arms; timeout; cancel; default | `src/csp/select.zig` |
@@ -257,7 +266,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 | Entity | Role | Files |
 |--------|------|--------|
 | **CancelToken** | Atomic flag, parent→children link, waiters | `src/core/cancellation.zig` |
-| **Scope** | Group of children + token; `joinAll`; optional cancel-on-leave | `src/core/structured_concurrency.zig` |
+| **Scope** | Group of children + token; `WaitGroup` join (last child wakes the parent) | `src/core/structured_concurrency.zig` |
 | **Nursery** | Scope + deadline/timeout + `cancel_on_first_done` + `tryJoin` | `structured_concurrency.zig` |
 
 **Cooperative rule:** cancel **does not interrupt** machine code. Children must **poll** the token (or wait on select/channel with cancel). A deliberate “explicit over implicit” choice.
@@ -266,7 +275,7 @@ Below is a full catalog of “what exists in the system” and **where the code 
 
 | Entity | Role | Files |
 |--------|------|--------|
-| **TimerQueue** | Near-term **wheel** (256×1 ms) + min-heap for long deadlines; `sleep`, `fireExpired` | `src/core/timer_queue.zig` |
+| **TimerQueue** | Near-term **wheel** (256×1 ms) + min-heap for long deadlines; occupied **bitmap** (`@ctz` on 4×u64) for `nextDeadlineNs`; `sleep`, `fireExpired` | `src/core/timer_queue.zig` |
 | Integration | Scheduler in idle fires expired timers | `fifo_scheduler.zig`, `work_stealing_scheduler.zig`, … |
 
 #### 2.3.8. Synchronization (task-aware)
@@ -275,8 +284,8 @@ Below is a full catalog of “what exists in the system” and **where the code 
 |-----------|----------|--------|
 | **SpinLock** | Short spin + OS yield | `src/core/synchronization.zig` |
 | **ParkingLot** | Park/wake a waiter list | `synchronization.zig` |
-| **Semaphore / Mutex** | Atomic/CAS uncontended; multi-worker short spin; else park | `synchronization.zig` |
-| **RwLock** | Shared/exclusive; writer preference | `synchronization.zig` |
+| **Semaphore / Mutex** | Atomic/CAS uncontended; multi-worker short spin; else park. Mutex unlock **handoffs** to the waiter on the same worker via a non-stealable continuation (park returns to the worker loop, not the unlocker frame) | `synchronization.zig`, `work_stealing_scheduler.zig` |
+| **RwLock** | Shared/exclusive; **atomic reader count**; park only when a writer is present or waiting; writer preference | `synchronization.zig` |
 | **RateLimiter** | Token bucket; sleep + wake waiters | `synchronization.zig` |
 | **Notify** | One/all wake of parked tasks | `synchronization.zig` |
 | **Watch(T)** | Broadcast latest value + version | `synchronization.zig` |
@@ -287,13 +296,13 @@ Below is a full catalog of “what exists in the system” and **where the code 
 
 | Entity | Role | Files |
 |--------|------|--------|
-| **Backend** (vtable) | poll / register / readiness | `src/io/io_backend.zig` |
-| **PollReactor** | Linux epoll · Windows `select` · POSIX poll; `cancelAll` | `src/io/poll_reactor.zig` |
-| **IocpBackend** | Windows IOCP | `src/io/iocp_backend.zig` |
-| **IoUringBackend** | Linux io_uring | `src/io/io_uring_backend.zig` |
+| **Backend** (vtable) | `wait` / `poll` / `wakeup` / optional overlapped `async_read`/`async_write` | `src/io/io_backend.zig` |
+| **PollReactor** | Linux epoll + eventfd · Windows `select` (256 fds) + UDP wakeup · POSIX poll + pipe; one poller, `wakeup` only while blocked | `src/io/poll_reactor.zig` |
+| **IocpBackend** | Windows IOCP: `WSARecv`/`WSASend` completions (request on the heap), `PostQueuedCompletionStatus` wakeup, `CancelIoEx` + `cancelAll` | `src/io/iocp_backend.zig` |
+| **IoUringBackend** | Linux io_uring completions (heap `UringReq` + CQE lifetime) + poll fallback; `ASYNC_CANCEL` on `cancelAll` | `src/io/io_uring_backend.zig` |
 | **MockBackend** | Tests without a real network | `src/io/mock_backend.zig` |
-| **TcpListener / TcpStream / UdpSocket** | Fiber-friendly sockets; park on readiness | `src/io/network.zig` |
-| **Backend.cancelAll** | Drop all I/O waiters with `Closed` (hang safety) | `src/io/io_backend.zig`, backends |
+| **TcpListener / TcpStream / UdpSocket** | Fiber-friendly sockets; TCP read/write use overlapped I/O when the backend `supports_async`; else park on readiness | `src/io/network.zig` |
+| **Backend.cancelAll** | Drop readiness waiters and cancel pending overlapped ops with `Closed` | `src/io/io_backend.zig`, backends |
 | **IoAdapter** | Bridge to `std.Io` (async/await-style I/O from a fiber) | `src/io/std_io_adapter.zig`, `async_future.zig` |
 | Re-exports | | `src/io/io.zig` |
 
@@ -305,27 +314,19 @@ Below is a full catalog of “what exists in the system” and **where the code 
 | **Metrics** | Atomic counters: spawns, yields, parks, steals, … | `src/core/metrics.zig` |
 | **Preemption / checkpoint** | Cooperative quantum yield | `src/core/preemption.zig` |
 | **Tracing / RingTracer** | Opt-in event emit | `src/core/tracing.zig` |
-| **C bindings** | Foreign surface | `src/abi/c_bindings.zig` |
+| **C bindings** | Foreign surface (`include/zigroutines.h`, static lib) | `src/abi/c_bindings.zig` |
 
 #### 2.3.11. Utilities
 
 | Structure | Role | Files |
 |-----------|------|--------|
-| Chase-Lev deque | Work-stealing queues | `src/utils/chase_lev.zig` |
+| Chase-Lev deque | Lock-free work-stealing queues | `src/utils/chase_lev.zig` |
 | Intrusive list | Wait queues (channel, sync, join) | `src/utils/intrusive_list.zig` |
 | Ring queue | FIFO ready queue | `src/utils/ring_queue.zig` |
 | Priority queues | Priority scheduler | `src/utils/priority_queues.zig` |
 | task_wake / worker_wake | Safe wake with on_cpu spin | `src/utils/task_wake.zig`, `worker_wake.zig` |
 | windows_api | Windows helpers | `src/utils/windows_api.zig` |
 
-
-### 2.4. Invariants (brief)
-
-1. Park/wake: waiter is marked `parked` **under the lock** before `parkFromRunning`; the waker waits for `!on_cpu` and only then `enqueue`.
-2. Channel close: all send/recv waiters get `Closed` and are woken.
-3. Destroy channel: assert empty wait queues (no dangling parked waiters).
-4. Runtime deinit: drain pool, destroy I/O, collect unjoined dead tasks.
-5. Cancellation: hierarchical, but **cooperative**.
 
 ---
 
@@ -447,6 +448,30 @@ _ = try nursery.spawn(.{}, child, .{nursery.token()});
 _ = nursery.join() catch |err| { ... };
 ```
 
+### 3.6. C ABI
+
+```c
+#include "zigroutines.h"
+
+static void worker(void *ud) {
+    zr_channel *ch = ud;
+    uintptr_t v = 0;
+    if (zr_channel_recv(ch, &v) == 0)
+        zr_channel_send(ch, v + 1);
+}
+
+int main(void) {
+    zr_runtime *rt = zr_runtime_create(1);
+    zr_channel *ch = zr_channel_create(1);
+    zr_spawn(rt, worker, ch);
+    zr_channel_send(ch, 41);
+    zr_runtime_run(rt);
+    zr_channel_destroy(ch);
+    zr_runtime_destroy(rt);
+    return 0;
+}
+```
+
 ---
 
 ## 4. Tests and coverage
@@ -459,9 +484,10 @@ zig build test
 
 | Layer | Files | Cases |
 |-------|-------|--------|
-| **Unit** | `stack_pool`, `channel_lifecycle`, `cancellation_token`, `metrics`, `preemption`, `stack_guard_and_canary`, `synchronization`, `rwlock_exclusive`, `actor_lifecycle` | alloc/free, policies construct, cancel flag, metrics on/off, checkpoint, canary/guard, mutex/sem/park, exclusive RwLock, actor destroy/cancel |
+| **Unit** | `stack_pool`, `channel_lifecycle`, `cancellation_token`, `metrics`, `preemption`, `stack_guard_and_canary`, `synchronization`, `rwlock_exclusive`, `timer_queue`, `actor_lifecycle` | alloc/free, `createPooled` recycle, policies construct, cancel flag, metrics on/off, checkpoint, canary/guard, mutex/sem/park, exclusive + concurrent shared RwLock, Notify `notifyAll`, RateLimiter multi-waiter, wheel `nextDeadline`, actor destroy/cancel |
+| **C ABI** | `abi/c_abi.zig` + `c_abi_main.c` | version, empty run, spawn+yield, channel send/recv, try+sleep, null handles, would-block, recv-after-close; C executable linked against `zigroutines.lib` |
 | **Integration** | `context_switch`, `fifo_scheduler`, `work_stealing_scheduler`, `channel_messaging`, `select_cancellation_scope`, `advanced_features`, `drop_newest_and_nursery` | swap/deep stack, spawn/yield, multi-worker, buffered/rendezvous/close/try/mpmc, select timeout/cancel/recvAny, multi-select, drop_*, nursery timeout/tryJoin/cancel_on_first_done, spawnResult error, priority, thread_per_task, actor, tracer, I/O backend create |
-| **I/O** | `mock_and_poll_backend`, `std_io_adapter`, `tcp_echo` | reactor, mock park/wake, IoAdapter, **TCP echo loopback**, UDP loopback, `cancelAll` watchdog |
+| **I/O** | `mock_and_poll_backend`, `std_io_adapter`, `tcp_echo` | reactor, mock park/wake, IoAdapter, **TCP/UDP echo** on poll and **IOCP**, `cancelAll` (poll + IOCP + io_uring); **io_uring TCP/UDP echo + cancelAll** (Linux) |
 | **Stress** | `multi_worker_channels` | WS pipeline, spawnResult, priority order |
 
 ### 4.2. What we treat as “necessary” cases
@@ -473,22 +499,20 @@ Covered and important:
 - Channel: buffered, rendezvous, close, try, mpmc, drop_oldest, drop_newest, error_full
 - Select: timeout, value, recvAny, cancel, multi + default
 - Hierarchical cancel, Scope join, Nursery timeout / tryJoin / cancel_on_first_done
-- Sync: mutex, semaphore handoff, rwlock shared+exclusive, rate limiter
-- Stack pool, guard, canary
+- Sync: mutex, semaphore handoff, rwlock shared+exclusive (atomic readers), rate limiter
+- Stack pool, opt-in canary cookie, guard arena reuse
 - Metrics, preemption, tracing
 - Actor lifecycle + cancel
 - spawnResult / error union
-- I/O mock, poll adapter; create IOCP/io_uring backends
-- **TCP echo loopback** (poll backend, select-based readiness on Windows) + UDP loopback
-- `Backend.cancelAll` — safe abort of stuck I/O waiters (tests / shutdown)
+- I/O mock, poll adapter; IOCP/io_uring backends
+- **TCP echo loopback** on poll and **IOCP** (overlapped read/write); UDP loopback on both
+- **io_uring** TCP/UDP echo + `cancelAll` (Linux; heap `UringReq` + CQE lifetime)
+- `Backend.cancelAll` — poll waiters, IOCP `CancelIoEx`, io_uring `ASYNC_CANCEL`
+- Poller `wakeup` so a blocked `select`/`epoll`/`GetQueuedCompletionStatusEx` sees new waiters
 - Multi-arm select without double-enqueue (idempotent schedule)
+- **C ABI** Zig tests + C-linked executable (`include/zigroutines.h`)
+- Channel `createPooled` recycle; RateLimiter N waiters; Notify `notifyAll`
 
-Intentionally weaker (future hardening):
-
-- Exhaustive multi-thread races on every primitive (mpmc + stress exist, not model checking)
-- Full e2e echo over **IOCP / io_uring** (create/destroy + `supports_async` covered; round-trip on poll)
-- C ABI integration tests
-- RateLimiter multi-waiter fairness under load
 
 ---
 
@@ -496,80 +520,231 @@ Intentionally weaker (future hardening):
 
 | Peer | Product | Measured in harness |
 |------|---------|---------------------|
-| **zigcoro** | thin stackful fibers + executor Channel | bounce, `n_tasks_1k/10k`, chan pipeline / cap-1 |
-| **libxev** | event loop (not fibers) | timer 100k, async notify, TCP/UDP ping |
-| **zio** | Runtime + Channel + sync | yield, spawn, nursery≈Group, channels, mutex/sem/rwlock excl, sleep |
+| **Go** | goroutines + `chan` / `select` | full matrix including TCP/UDP |
+| **Rust/Tokio** | multi-thread Tokio + `mpsc` / `select!` | full matrix including TCP/UDP |
+| **C++** | OS threads + helping thread-pool + ring/`rendezvous` `Chan` (not fibers) | full matrix including TCP/UDP (Winsock, `TCP_NODELAY`) |
+| **zigcoro** | single-thread stackful fibers + executor `Channel` | full name matrix; WS/priority/select/mutex/timer/I/O are stand-ins |
+| **libxev** | event loop (not fibers) | full name matrix; fiber/channel/select/sync stand-ins; real timers + TCP/UDP |
+| **zio** | Runtime + Channel + select + sync + net | full name matrix; priority = FIFO spawn; pooled create = stack init |
 
 
-### 5.1. Full comparison tables
+### 5.1. Languages (Go / Rust / C++)
 
-**Host:** Windows x86_64 · 12 CPUs
+**zigroutines column:** this tree, Windows x86_64, `zig build bench -Doptimize=ReleaseFast`.  
+**Language columns:** same machine (Windows x86_64  12 CPUs), same workloads, `go run` / `cargo build --release` / `g++ -O3 -pthread`. Bold = fastest in-row among measured.  
+C++ is an **OS-thread** baseline (helping pool + ring channel), not stackful fibers. Rust skynet/spawn/timers run on Tokio tasks, not `std::thread`.
 
 #### Fiber / spawn
 
-| Workload | **zigroutines** | **Go** | **Rust/Tokio** | **C++** | **zigcoro** | **libxev** | **zio** |
-|----------|----------------:|-------:|---------------:|--------:|------------:|-----------:|--------:|
-| `ctx_switch_bounce` | **4.5 ns** | n/a | n/a | n/a | 16.4 ns | n/a   | n/a   |
-| `yield_pingpong` | **6.7 ns** | 97.2 ns | 357 ns | 45.9 ns | n/a   | n/a   | 8.9 ns |
-| `yield_single` | 49 ns  | 175 ns | **32 ns** | 99 ns | n/a   | n/a   | **4.9 ns** |
-| `yield_ws_4w` | 127 ns | 234 ns | 177 ns | **66 ns** | n/a   | n/a   | n/a   |
-| `leaf_spawn_batch` | 300 ns | n/a | n/a | n/a | n/a   | n/a   | **170 ns** |
-| `spawn_join` | **209 ns** | 800 ns | 1678 ns | ~97k | n/a   | n/a   | 620 ns |
-| `spawn_result_join` | 15k ns | **800 ns** | 1459 ns | ~94k | n/a   | n/a   | n/a   |
-| `nursery_join` | 864 ns | 1500 ns | **685 ns** | ~46k | n/a   | n/a   | 184 ns (Group) |
-| `priority_dispatch` | **188 ns** | 400 ns | 805 ns | ~96k | n/a   | n/a   | n/a   |
-| `skynet_join_10k` | 14k ns | **900 ns** | 43k | 48k | n/a   | n/a   | n/a   |
-| `n_tasks_1000` | **30 ns** | 300 ns | 74 ns | 2224 | 28 ns | n/a   | 41 ns |
-| `n_tasks_10000` | 69 ns | 400 ns | 71 ns | 2215 | 104 ns | n/a   | **36 ns** |
-| `n_tasks_50000` | 97 ns | 477 ns | **67 ns** | n/a | skipped | n/a   | skipped |
-| density / stack | **2 KiB** fixed | growable | stackless | OS thr | 4 KiB default | n/a | growable |
-
+| Workload | **zigroutines** | **Go** | **Rust/Tokio** | **C++** |
+|----------|----------------:|-------:|---------------:|--------:|
+| `ctx_switch_bounce` | **4.2 ns** | 313 ns | 437 ns | 12.1k |
+| `yield_pingpong` | **5.6 ns** | 103 ns | 272 ns | 28.5 ns |
+| `yield_single` | **6.7 ns** | 150 ns | 18.4 ns | 71.5 ns |
+| `yield_ws_4w` | **11.9 ns** | 137 ns | 162 ns | 33.3 ns |
+| `leaf_spawn_batch` | **85.3 ns** | 489 ns | 559 ns | 9.2k |
+| `spawn_join` | **127 ns** | 897 ns | 1130 ns | 58.5k |
+| `spawn_result_join` | **141 ns** | 997 ns | 1186 ns | 75.8k |
+| `nursery_join` | **154 ns** | 499 ns | 529 ns | 9.2k |
+| `priority_dispatch` | **284 ns** | 399 ns | 516 ns | 59.6k |
+| `skynet_join_10k` | 404 ns | 538 ns | **219 ns** | 10.2k |
+| `n_tasks_1000` | 66.2 ns | 199 ns | **54.6 ns** | 127 ns |
+| `n_tasks_10000` | 240 ns | 314 ns | **69.8 ns** | 370 ns |
+| `n_tasks_50000` | 247 ns | 425 ns | **64.0 ns** | 155 ns |
+| density / stack | **2 KiB** fixed (guard ≈ 4 KiB RSS) | growable | stackless | OS thr |
 
 #### Channel / actor
 
-| Workload | **zigroutines** | **Go** | **Rust** | **C++** | **zigcoro** | **libxev** | **zio** |
-|----------|----------------:|-------:|---------:|--------:|------------:|-----------:|--------:|
-| `chan_pipeline_buf256` | **16 ns** | 67.7 | 167 | 195 | ~3 ns (executor Chan) | n/a   | 36.7 ns |
-| `chan_rendezvous` | **86 ns** | 340 | 508 | 24k | 68 ns (cap-1) | n/a   | 86.9 ns |
-| `chan_mpmc_4x4` | 181 ns | **100 ns** | 96 | 287 | n/a   | n/a   | skipped |
-| `chan_try_uncontended` | **15.4 ns** | 60 | 34.5 | 38.9 | n/a   | n/a   | 31.9 ns |
-| `chan_create_buf8` cold | 6.5k | **140** | 282 | 168 | n/a   | n/a   | n/a   |
-| `chan_create_buf8_pooled` | **34.3 ns** | 140 | 282 | 168 | n/a   | n/a   | n/a   |
-| `chan_closed_drain` | 22.8 | 20 | **18.2** | 22.3 | n/a   | n/a   | **15.4 ns** |
-| `chan_prodcons_work` | **24.6 ns** | 220 | 32.7 | 278 | n/a   | n/a   | skipped |
-| `chan_popular_256` | **87.5 ns** | 618 | 2015 | 192k | n/a   | n/a   | n/a   |
-| `chan_sem` | **11.8 ns** | 40 | 27.2 | 43 | n/a   | n/a   | n/a   |
-| `actor_mailbox` | **15.4 ns** | 100 | 22.1 | 164 | n/a   | n/a   | n/a   |
-
+| Workload | **zigroutines** | **Go** | **Rust** | **C++** |
+|----------|----------------:|-------:|---------:|--------:|
+| `chan_pipeline_buf256` | **19.9 ns** | 74.8 | 114 | 140 |
+| `chan_rendezvous` | **56.9 ns** | 324 | 370 | 8.8k |
+| `chan_mpmc_4x4` | 134 ns | 74.9 | **69.3** | 193 |
+| `chan_try_uncontended` | **17.2 ns** | 52.8 | 18.0 | 24.9 |
+| `chan_create_buf8` cold | **20.9 ns** | 229 | 168 | 58.1 |
+| `chan_create_buf8_pooled` | **20.3 ns** | 229 | 168 | 58.1 |
+| `chan_closed_drain` | 27.6 ns | 29.9 | **12.6** | 15.2 |
+| `chan_prodcons_work` | **21.6 ns** | 319 | 31.6 | 350 |
+| `chan_popular_256` | **57.3 ns** | 567 | 3972 | 8.8k |
+| `chan_sem` | **13.7 ns** | 44.9 | 22.5 | 26.9 |
+| `actor_mailbox` | **21.5 ns** | 79.7 | 39.7 | 138 |
 
 #### Select
 
-| Workload | **zigroutines** | **Go** | **Rust/Tokio** | **C++** | **zigcoro** | **libxev** | **zio** |
-|----------|----------------:|-------:|---------------:|--------:|------------:|-----------:|--------:|
-| `select_fanin_2` | **47.5 ns** | 220 | 234 | 257 | n/a   | n/a   | skipped |
-| `select_uncontended` | **20.7 ns** | 116 | 155 | 48.5 | n/a   | n/a   | skipped |
-| `select_nonblock` | **18.9 ns** | 85 | 25.3 | 34.5 | n/a   | n/a   | skipped |
-| `select_sync_contended` | **75.4 ns** | 367 | 283 | 307 | n/a   | n/a   | skipped |
+| Workload | **zigroutines** | **Go** | **Rust/Tokio** | **C++** |
+|----------|----------------:|-------:|---------------:|--------:|
+| `select_fanin_2` | **26.3 ns** | 179 | 155 | 192 |
+| `select_uncontended` | **26.4 ns** | 99.7 | 98.8 | 30.1 |
+| `select_nonblock` | 17.6 ns | 69.8 | **15.0** | 23.0 |
+| `select_sync_contended` | **30.1 ns** | 300 | 122 | 193 |
 
 #### Sync / timers
 
-| Workload | **zigroutines** | **Go** | **Rust** | **C++** | **zigcoro** | **libxev** | **zio** |
-|----------|----------------:|-------:|---------:|--------:|------------:|-----------:|--------:|
-| `mutex_uncontended` | **15 ns** | 15.0 | 16.0 | 16.5 | n/a   | n/a   | 14.3 ns |
-| `mutex_contended_4` | 537 ns | **30** | 128 | 46 | n/a   | n/a   | skipped |
-| `sem_handoff` | **17.7 ns** | 80 | 95.5 | 149 | n/a   | n/a   | 48.1 ns |
-| `rwlock_shared_4` | 152 | **40** | 131 | 643 | n/a   | n/a   | skipped |
-| `rwlock_exclusive` | **16.6 ns** | 30 | **15.5** | 96.8 | n/a   | n/a   | 27.7 ns |
-| `timer_sleep_batch` | **~500 ns** | 804 | 5105 | 68k | n/a   | n/a   | 2060 ns |
-| `timer_many_100k_dispatch` | **~670 ns** | 558 | 811 | 214k ‖ | n/a   | 1000 ns | n/a   |
-
+| Workload | **zigroutines** | **Go** | **Rust** | **C++** |
+|----------|----------------:|-------:|---------:|--------:|
+| `mutex_uncontended` | 13.0 ns | 14.9 | **9.2** | 11.8 |
+| `mutex_contended_4` | **26.6 ns** | 29.9 | 61.8 | 27.9 |
+| `sem_handoff` | **19.3 ns** | 59.8 | 55.4 | 107 |
+| `rwlock_shared_4` | **36.3 ns** | 44.9 | 68.6 | 339 |
+| `rwlock_exclusive` | 12.1 ns | 29.9 | **10.9** | 53.5 |
+| `rate_limiter_try` | **38.8 ns** | n/a | n/a | n/a |
+| `timer_sleep_batch` | **471 ns** | 997 | 3826 | 8.0k |
+| `timer_many_100k_dispatch` | 761 ns | **409** | 835 | 8.7k |
 
 #### I/O
 
-| Workload | **zigroutines** | **Go** | **Rust** | **C++** | **zigcoro** | **libxev** | **zio** |
-|----------|----------------:|-------:|---------:|--------:|------------:|-----------:|--------:|
-| `tcp_pingpong` | **~100k RT/s** | n/a | n/a | n/a | n/a   | ~68k RT/s · 14.7 µs/RT | skipped |
-| `udp_ping` | **~350k pkt/s** | n/a | n/a | n/a | n/a   | ~204k pkt/s · 4.9 µs/pkt | skipped |
+| Workload | **zigroutines** | **Go** | **Rust** | **C++** |
+|----------|----------------:|-------:|---------:|--------:|
+| `tcp_pingpong` (poll) | **110k RT/s** | 55.0k | 38.3k | 67.6k |
+| `tcp_pingpong` (IOCP) | **146k RT/s** | 55.0k | 38.3k | 67.6k |
+| `tcp_pingpong` (io_uring) | **321k RT/s** (WSL2 5.15) | 55.0k | 38.3k | 67.6k |
+| `udp_ping` (poll) | **376k pkt/s** | 148k | 336k | 250k |
+| `udp_ping` (io_uring) | **1651k pkt/s** (WSL2 5.15) | 148k | 336k | 250k |
+
+### 5.2. Zig libraries (zigcoro / libxev / zio)
+
+Same machine and workloads as 5.1. Every name is printed even when the peer has no matching primitive — those cells are tagged stand-ins, not the same mechanism. Bold = fastest **real** implementation of that named workload (stand-ins are never bolded).
+
+| Tag | Meaning |
+|-----|---------|
+| `(FIFO)` | no priority scheduler; timed as ordinary spawn |
+| `(1T)` | single-thread round-robin, not work-stealing / MPMC |
+| `(q)` | spinlock `ArrayList` queue, not a channel |
+| `(stack)` | `Channel.init` on a stack buffer, not a heap allocate |
+| `(loop)` | empty increment loop (libxev has no fibers) |
+| `(async)` | libxev `Async.notify` as a yield/switch stand-in |
+| `(spin)` | spin-loop, not a scheduler yield |
+| `(ch)` | capacity-1 channel used as a mutex |
+| `(load)` | plain load, no reader lock |
+| `(spawn)` | spawn+resume, not a timer wheel |
+| `(poll)` | `tryRecv` / `recv` fallback, not `select` |
+| `(try)` | `tryRecv` only, no wait set |
+| `(thr)` | OS threads + spinlock, not fiber mutexes |
+| `(thread)` | blocking Winsock on an OS thread |
+
+
+
+#### Fiber / spawn
+
+| Workload | **zigroutines** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|------------:|-----------:|--------:|
+| `ctx_switch_bounce` | **4.2 ns** | 14.8 ns | 144 ns (async) | 79.8 ns |
+| `yield_pingpong` | **5.6 ns** | 31.8 ns | 136 ns (async) | 11.0 ns |
+| `yield_single` | 6.7 ns | 32.9 ns | 275 ns (async) | **3.1 ns** |
+| `yield_ws_4w` | 11.9 ns | 31.4 ns (1T) | 37.7 ns (spin) | **6.0 ns** |
+| `leaf_spawn_batch` | **85.3 ns** | 96.5 ns | 0.7 ns (loop) | 178 ns |
+| `spawn_join` | 127 ns | **78.4 ns** | 0.7 ns (loop) | 537 ns |
+| `spawn_result_join` | 141 ns | **80.8 ns** | 0.7 ns (loop) | 220 ns |
+| `nursery_join` | 154 ns | **78.5 ns** | 0.7 ns (loop) | 178 ns (Group) |
+| `priority_dispatch` | **284 ns** | 69.6 ns (FIFO) | 0.7 ns (loop) | 180 ns (FIFO) |
+| `skynet_join_10k` | 404 ns | **64.9 ns** | 0.7 ns (loop) | 456 ns |
+| `n_tasks_1000` | 66.2 ns | **29.9 ns** | 36.6 ns (spin) | 40.7 ns |
+| `n_tasks_10000` | 240 ns | 126 ns | 38.3 ns (spin) | **37.5 ns** |
+| `n_tasks_50000` | 247 ns | 123 ns | 38.7 ns (spin) | **38.3 ns** |
+| density / stack | **2 KiB** fixed (guard ≈ 4 KiB RSS) | 4 KiB default | n/a | growable |
+
+#### Channel / actor
+
+| Workload | **zigroutines** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|------------:|-----------:|--------:|
+| `chan_pipeline_buf256` | 19.9 ns | **6.8 ns** | 21.6 ns (q) | 42.4 ns |
+| `chan_rendezvous` | **56.9 ns** | 114 ns | 12.8 ns (q) | 94.1 ns |
+| `chan_mpmc_4x4` | 134 ns | 7.2 ns (1T) | 12.8 ns (q) | **55.4 ns** |
+| `chan_try_uncontended` | 17.2 ns | **3.2 ns** | 13.1 ns (q) | 34.3 ns |
+| `chan_create_buf8` cold | 20.9 ns | **1.6 ns** (stack) | 1.2 ns (q) | 2.1 ns (stack) |
+| `chan_create_buf8_pooled` | **20.3 ns** | 1.4 ns (stack) | 1.2 ns (q) | 1.9 ns (stack) |
+| `chan_closed_drain` | 27.6 ns | **7.9 ns** | 6.9 ns (q) | 40.3 ns |
+| `chan_prodcons_work` | 21.6 ns | **8.0 ns** | 13.7 ns (q) | 43.7 ns |
+| `chan_popular_256` | **57.3 ns** | 185 ns | 12.8 ns (q) | 101 ns |
+| `chan_sem` | **13.7 ns** | 120 ns | 14.0 ns (q) | 39.8 ns |
+| `actor_mailbox` | 21.5 ns | **4.2 ns** | 13.0 ns (q) | 54.0 ns |
+
+#### Select
+
+| Workload | **zigroutines** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|------------:|-----------:|--------:|
+| `select_fanin_2` | **26.3 ns** | 7.9 ns (poll) | 26.4 ns (q) | 85.4 ns |
+| `select_uncontended` | **26.4 ns** | 4.0 ns (poll) | 12.8 ns (q) | 62.1 ns |
+| `select_nonblock` | 17.6 ns | **3.0 ns** (try) | 6.6 ns (q) | 33.1 ns |
+| `select_sync_contended` | **30.1 ns** | 8.2 ns (poll) | 12.8 ns (q) | 81.2 ns |
+
+#### Sync / timers
+
+| Workload | **zigroutines** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|------------:|-----------:|--------:|
+| `mutex_uncontended` | **13.0 ns** | 4.1 ns (ch) | 6.8 ns (spin) | 15.8 ns |
+| `mutex_contended_4` | 26.6 ns | 5.7 ns (ch) | 48.4 ns (thr) | **24.4 ns** |
+| `sem_handoff` | **19.3 ns** | 122 ns (ch) | 97.9 ns (spin) | 47.6 ns |
+| `rwlock_shared_4` | **36.3 ns** | 0.5 ns (load) | 59.9 ns (spin) | 38.0 ns |
+| `rwlock_exclusive` | **12.1 ns** | 4.2 ns (ch) | 6.5 ns (spin) | 24.2 ns |
+| `rate_limiter_try` | **38.8 ns** | n/a | n/a | n/a |
+| `timer_sleep_batch` | **471 ns** | 104 ns (spawn) | 8.7k | 1021 ns |
+| `timer_many_100k_dispatch` | 761 ns | 100 ns (spawn) | 1034 ns | **432 ns** |
+
+#### I/O
+
+| Workload | **zigroutines** | **zigcoro** | **libxev** | **zio** |
+|----------|----------------:|------------:|-----------:|--------:|
+| `tcp_pingpong` (poll) | **110k RT/s** | 66.4k (thread) | 48.9k | 94.2k |
+| `tcp_pingpong` (IOCP) | **146k RT/s** | 66.4k (thread) | 48.9k | 94.2k |
+| `tcp_pingpong` (io_uring) | **321k RT/s** (WSL2 5.15) | 66.4k (thread) | 48.9k | 94.2k |
+| `udp_ping` (poll) | **376k pkt/s** | 259k (thread) | 178k | 167k |
+| `udp_ping` (io_uring) | **1651k pkt/s** (WSL2 5.15) | 259k (thread) | 178k | 167k |
+
+### 5.3. Why you cannot compare these libraries as if they were the same product
+
+
+#### They are different machines
+
+| | **libxev** | **zigcoro** | **zio** | **zigroutines** |
+|--|------------|-------------|---------|-----------------|
+| Job | Event loop (proactor / completions) | Thin stackful coroutines + a single-thread executor | Async **runtime** (Tokio/Go spirit): coroutines + I/O + `std.Io` | Explicit **concurrency stack**: you construct a `Runtime` |
+| Unit of work | Completion callback | `xasync` / `xresume` / `xsuspend` | Stackful task on an executor | Stackful task (`spawn`) + opt-in stackless `spawnLeaf` |
+| Stack | None (callbacks) | You pass a buffer (default 4 KiB) | **Growable** — VM reservation that extends | **Fixed 2 KiB only** — pool, optional canary/guard |
+| Schedule | No task scheduler | One thread, cooperative | M:N, work-steal **or** pin; wake is I/O-coupled | FIFO / work-steal / **priority** / 1:1 — same `spawn` |
+| CSP | None | Executor `Channel` (one thread) | Channel + wait-protocol “select” | First-class `Channel` + 32-arm `select`, backpressure, cancel |
+| I/O | The product | Optional, via libxev | **Baked into** the runtime | **Plugin** — `none` until you set poll / IOCP / io_uring |
+| Cancel / nursery | You build it | Limited | Task groups + cancel | Hierarchical `CancelToken`, `Scope` / `Nursery` |
+| Quiet by default | You wire a loop | Executor is the program | Runtime **is** the netpoller | Core stays quiet; no poller until configured |
+| Function color | Callbacks | No | Native API or `std.Io` | No — `send` / `recv` / `sleep` look like ordinary calls |
+
+**libxev** is not a concurrency library. It is a cross-platform completion loop (the Zig-shaped cousin of libuv / io_uring). Ghostty uses it that way. There is no task, no stack, no channel, no `select`. A “spawn” number against libxev is either an empty loop or “arm a completion.” A channel number is a mutex queue we invented so the name would print. Use libxev when you **want** a loop. Do not use a fiber table to decide between a loop and a runtime.
+
+**zigcoro** is a coroutine primitive: swap a stack, maybe run an `Executor`, maybe put a `Channel` on it. That is a useful brick. It is not a product you write a service in. There is no work-stealing, no priority, no multi-arm `select`, no timer wheel, no mutex that parks a fiber, no I/O reactor of its own, no structured cancel. Stacks are your problem. When zigcoro “wins” `ctx_switch`, `spawn_join`, `skynet`, or `chan_pipeline`, it wins because the path is **one thread, no steal, no TCB policy, no cancel metadata, no MPMC atomics**. That is a thinner machine. It is also why those wins do not transfer to a multi-core server.
+
+**zio** is the only peer in the same *category*: a real runtime. Coroutines, executors, channels, select-like waits, sync, network, structured groups. It is also a different **design bet**. Stacks **grow** by extending a VM reservation (convenient, Go-like, RSS is not a number you picked). I/O is not a plugin — the runtime *is* an async I/O framework that happens to schedule coroutines, and the blessed path is `std.Io`. There is no priority scheduler. There is no “leave the netpoller off.” You take the runtime as a whole. That is a coherent choice. It is not the zigroutines choice.
+
+**zigroutines** starts from the opposite end. The thing you construct is a `Runtime`, not a loop. The thing you spawn is a task with a **fixed** stack. I/O is a backend you enable. The scheduler is a **policy** on the same API. Channels and `select` are the API, not an add-on. Cancel is hierarchical. Density is a number (2 KiB, pool, optional guard arena) instead of “it will grow.” The cost of that bet is visible in 5.2: we pay atomics, a TCB, a steal-safe queue, a join handle, and a 2 KiB stack on paths where zigcoro only swaps and zio only yields.
+
+#### What a “loss” actually paid for
+
+These are the rows a skimming reader will use against us. Each one is a constraint we refused to drop.
+
+- **`yield_single` / `yield_ws_4w` — zio 3.1 / 6.0 ns vs 6.7 / 11.9.** zio’s yield is a thinner “give up this executor.” Ours goes through the **same** scheduler that has to be correct under work-stealing, priority, cancel, and “parked on a channel.” You do not get a special fast yield that stops working when you turn workers on.
+- **`skynet_join_10k` / `spawn_join` — zigcoro 65 / 78 ns vs 404 / 127.** zigcoro is creating frames on one thread and awaiting them. We create a task that a **worker** can steal, with a pooled 2 KiB stack, a join handle, and (for skynet) `spawnLeaf` only on the nodes that never park. The extra nanoseconds are the M:N tax. Tokio beats us on skynet and `n_tasks_*` for the same reason it beats everyone stackful: a Tokio task is a **state machine**, not 2 KiB of stack. That model colors every function `async`. We will not take that deal on Zig.
+- **`chan_pipeline` — zigcoro 6.8 ns vs 19.9.** Their `Channel` is a single-thread ring on the executor. Ours is safe for four producers and four consumers, has rendezvous, close, `select`, and four full policies. The 13 ns is the price of “this channel still works when you add a worker.”
+- **`timer_many_100k` — zio 432 ns vs 761.** They have a tighter timer path. Ours is a 256×1 ms wheel plus heap overflow plus a sub-tick yield so `sleep(50 ns)` is not quantized to 1 ms. We lose the “arm 100k and fire” cell; we keep one sleep API that is honest at both 50 ns and 50 ms.
+
+
+#### Why this is still the library to take on Zig
+
+You are not choosing a nanosecond. You are choosing **what you will write for the next two years**.
+
+1. **One surface, not a kit.** libxev does not give you tasks. zigcoro does not give you a scheduler, I/O, or cancel. zio gives you a runtime you cannot turn the poller off of, and stacks that grow. With zigroutines you `Runtime.init`, `spawn`, `Channel.create`, `select`, and — if you need it — set `.io = .iocp`. The same program can be compute-only on Monday and IOCP on Tuesday without a rewrite.
+
+2. **The model matches how you already want to write Zig.** `send` / `recv` / `sleep` / `accept` look like ordinary calls. The task parks; another task runs. No `async` infection, no `Pin`/`Send` puzzle, no callback inversion. That is the whole point of stackful. zigcoro has the swap and stops there. zio has the swap and then ties you to its I/O. We have the swap **and** the product around it.
+
+3. **Resources stay a number you picked.** Fixed 2 KiB, pool on, guard optional and shared. Ten thousand tasks are ~40 MiB of stacks, not “however far the growable mapping went after the JSON parser recursed.” zio’s growable stacks are a genuine convenience. They are also how you get a surprise RSS bill. We made the inconvenient choice on purpose.
+
+4. **The scheduler is a policy, not a fork.** FIFO on one worker, work-stealing on N, priority when a timer must cut the line, thread-per-task when you must. Same `spawn`. zigcoro is one thread. zio is steal-or-pin. libxev is not a scheduler. If your program’s shape changes, you change a field, not a library.
+
+5. **I/O is a backend, not the religion.** A lot of concurrent Zig is *not* a network server. Embedding a netpoller in the core so that `yield` is fast is how you get a library that is wrong for half its users. We lose a yield cell to zio and keep “no poller” as the default. When you do want I/O, poll / IOCP / io_uring are the same TCP helpers, and on this machine that path is the fastest one in the table (110k / 146k / 321k RT/s).
+
+6. **A loss in 5.2 is usually a feature you will need by week two.** Multi-worker safety. `select` with timeout and cancel. A nursery that tears the children down. A channel that still has backpressure when the consumer is slow. A stack that cannot silently become 64 KiB. The library that “won” that row typically does not have that feature. Shipping the thinner machine means you will re-implement the missing piece — and then you no longer have the nanosecond you bought.
+
+zio is a serious runtime and the only fair *category* peer. If you want growable stacks and `std.Io` as the center of the universe, take zio. If you want a completion loop, take libxev. If you want a coroutine brick to build your own runtime, take zigcoro.
+
+If you want **to write concurrent Zig** — tasks that look synchronous, channels you can `select` on, cancel that actually unwinds a tree, I/O you can leave off, and a memory bill you can explain — take zigroutines. The benches where we are not first are the benches where the winner was allowed to be a smaller library.
 
 
 ## 6. Runtime configuration (cheat sheet)
@@ -580,7 +755,8 @@ var rt = try zr.Runtime.init(alloc, .{
     .policy = .work_stealing,        // auto | single_thread_fifo | work_stealing | priority | thread_per_task
     .stack_pool = true,              // 2 KiB stack freelist (default)
     .task_freelist = true,           // recycle Task control blocks (default)
-    .stack_guard_page = false,       // opt-in overflow fault
+    .stack_protect = .none,          // none | canary | guard (opt-in)
+    .stack_guard_page = false,       // compat: true → .guard
     .stack_paint_canary = false,     // opt-in high-water measurement
     .io = .none,                     // none | poll | iocp | io_uring
     .metrics = false,
@@ -599,14 +775,15 @@ Optional features (all opt-in):
 Runtime.workers / policy     : multi-core WS, priority, 1:1
 Runtime.io                   : poll | iocp | io_uring
 Runtime.stack_pool           : reuse
-Runtime.stack_guard_page     : overflow fault
+Runtime.stack_protect        : none | canary | guard
+Runtime.stack_guard_page     : compat alias for guard
 Runtime.stack_paint_canary   : high-water scan
 Runtime.metrics              : counters
 Runtime.preempt / checkpoint : cooperative quantum
 Channel full_policy          : block | drop_newest | drop_oldest | error_full
 select timeout / cancel      : timer + CancelToken
-Scope / Nursery              : structured join, deadline
-spawnResult                  : typed JoinHandle
+Scope / Nursery              : structured join (WaitGroup), deadline
+spawnResult                  : typed JoinHandle (args/result on the fiber stack when they fit)
 TcpListener / TcpStream / UdpSocket
 IoAdapter (std.Io)
 Actor(Message)
@@ -615,3 +792,64 @@ C ABI / tracing hooks
 
 ---
 
+## 7. Changelog
+
+### 1.0.0 (2026-08-15)
+
+#### Runtime / fibers
+
+- **TCB vs frames.** Was: the task control block lived where a growing frame could overwrite it (Windows `chkstk` / deep spawn made this worse). Problem: silent corruption and Debug-mode crashes on a 2 KiB stack. Now: 512 B TCB sits in a suffix *above* the 2 KiB usable stack; frames grow down and cannot smash control state.
+- **Spawn on a 2 KiB stack.** Was: `spawn` / `spawnResult` ran on the caller fiber. Problem: the spawn path itself does not fit in 2 KiB, so nested spawn (skynet, nursery) overflowed or had to bounce ad-hoc. Now: spawn always hops onto the worker stack and resumes the child immediately only if the ready queue is empty.
+- **Mutex unlock under work-stealing.** Was: unlock woke the waiter onto a stealable ready queue. Problem: another worker could steal the continuation and the unlocking fiber resumed with the mutex conceptually still “in flight”. Now: unlock installs a non-stealable `handoff_cont`; park returns to the worker loop and the waiter runs next on that worker.
+- **Linux context switch.** Was: `swapLinux` used the `to` pointer from a general-purpose register while also restoring `r12`–`r15`. Problem: if LLVM put `to` in one of those regs, restore clobbered the pointer → SEGV on the first fiber bench. Now: `to` is copied to `r11` first, same pattern as the Windows path.
+- **Stack-pool cap.** Was: default `max_per_class = 1024`. Problem: a 100k-fiber wave (`timer_many`, skynet) freed ~99k stacks back to the OS on join, dominating dispatch time. Now: default cache is 131072 slots; the wave returns to the pool instead of `HeapFree`.
+
+#### Timers
+
+- **Finding the next deadline.** Was: SmoothTeam scanned wheel slots linearly. Problem: idle `nextDeadlineNs` paid O(256) even when almost nothing was armed. Now: occupied bitmap `[4]u64` + `@ctz` jumps to the next live slot.
+- **Sub-tick sleep.** Was: `sleep(500 ns)` parked on the 1 ms wheel (and Windows `Sleep` rounds up to 1 ms). Problem: `timer_many_100k_dispatch` and `timer_sleep_batch` measured a millisecond wait, not a nanosecond sleep — 1197 ns/op and 798 ns/op. Now: `duration < 1 ms` yields until the deadline and never enters the wheel. Dispatch **1197 → 761 ns**, batch **798 → 471 ns**.
+
+#### Channels / sync
+
+- **Hot-path channel.** Was: mutex around the whole ring (or a coarse lock) for every send/recv. Problem: uncontended pipeline and rendezvous paid a lock even with no waiters. Now: Vyukov MPMC seq-slot ring; the lock is only for the waiter lists. Optional `spsc` / `mpsc` skip the extra atomics.
+- **Cold `Channel.create`.** Was: two heap allocations (header + slots) and `destroy` always ran `close()`. Problem: `chan_create_buf8` was **10.1k ns** (plus DebugAllocator in the harness made it look even worse). Now: one `alignedAlloc` for header+slots; unused destroy skips close. Harness uses `smp_allocator`. Cold create **10.1k → 20.9 ns**, pooled **28.7 → 20.3 ns**.
+- **Channel recycle.** Was: every create hit the heap; SmoothTeam had no pool. Problem: tests that used a leak-checking allocator could not recycle, so production code had no safe hot-create API. Now: `createPooled` / `recycle=true` is opt-in; default `create` stays leak-free under test allocators.
+- **RwLock readers.** Was: shared acquires took the big lock even with no writer. Problem: `rwlock_shared_4` serialized readers. Now: atomic reader count; park only if a writer is present or waiting.
+- **Rate limiter.** Was: no token-bucket primitive. Problem: callers built their own sleep loops and missed wake-on-refill. Now: `RateLimiter` parks waiters and wakes them as tokens refill (`rate_limiter_try` bench).
+
+#### I/O
+
+- **Poller.** Was: SmoothTeam created/destroyed poll and had a poll-only TCP echo; a blocked `select`/`epoll` did not see waiters registered after it went to sleep. Problem: hang on “add waiter while poller is in the kernel”. Now: Windows `select` (256 fds) + UDP wakeup, Linux epoll + eventfd, POSIX poll + pipe; `wakeup` only while the poller is blocked.
+- **IOCP.** Was: backend existed as “create/destroy + `supports_async`”, no overlapped echo. Problem: Windows I/O still went through readiness `select`, leaving 110k RT/s on the table and no `CancelIoEx` path. Now: heap `IoRequest` + freelist, `WSARecv`/`WSASend`, `PostQueuedCompletionStatus`, `CancelIoEx`. UDP stays readiness-based (not IOCP-associated). Echo + `cancelAll` are tested. IOCP pingpong **146k RT/s**.
+- **io_uring.** Was: placeholder “Linux / WSL2” in the tables; SmoothTeam never shipped an e2e number. Problem: no CQE-lifetime rules, cancel could use-after-free, and Zig 0.17 deleted `std.posix.socket`/`close`/`nanosleep`/`mprotect` so Linux did not even build. Now: heap `UringReq` + freelist, CQE harvest never blocks under the lock, `ASYNC_CANCEL` on `cancelAll`, Linux syscalls via `std.os.linux`. Measured on WSL2 5.15 (`CONFIG_IO_URING=y`): TCP **321k RT/s**, UDP **1651k pkt/s**.
+- **TCP helpers.** Was: bind/connect/accept/`read`/`write` ran on the fiber stack and used blocking sockets unless the backend said otherwise. Problem: Windows stack probes + sync `connect` blew the 2 KiB stack. Now: bind/connect/accept bounce to the worker; `read`/`write` use overlapped/async ops when `supports_async`.
+
+#### C ABI
+
+- **Foreign surface.** Was: none on SmoothTeam. Problem: C/C++ (and anything that cannot import a Zig module) had no way to construct a runtime or a channel. Now: `include/zigroutines.h` + static lib from `zig build` (Windows also needs `ws2_32` + `ntdll`). Covered by `tests/abi/c_abi.zig` and `zig build c-abi-test`.
+
+#### Tests / benches
+
+- **Windows Debug tests.** Was: `zig build test` in Debug was treated as the gate. Problem: 2 KiB + MSVC `chkstk` is unsafe; the suite red-herringed real bugs. Now: authoritative gate is `zig build test -Doptimize=ReleaseSafe`.
+- **Harness allocator.** Was: `DebugAllocator` (even with `safety=false`). Problem: ~10 µs per malloc, so `chan_create` / `skynet` measured the allocator, not the library. Now: `std.heap.smp_allocator`.
+- **`skynet_join_10k`.** Was: 11k stackful `spawnResult`s on one FIFO worker — **22.8k ns**/spawn (SmoothTeam published 14k). Problem: 10k leaves never park but still paid a 2 KiB stack and a bounce; one core vs Go’s `GOMAXPROCS`. Now: size-1 nodes are `spawnLeaf`, internals run on work-stealing across CPUs. **22.8k → 404 ns** (ahead of Go 538 ns).
+- **Coverage.** Was: poll echo only; no RateLimiter/Notify/`createPooled` unit tests. Now: TCP/UDP echo + `cancelAll` on poll and IOCP (Windows) and io_uring (Linux/WSL2); unit tests for pooled recycle, RateLimiter N waiters, `Notify.notifyAll`, timer-wheel bitmap.
+- **Tables.** Was: Go, Rust, C++, zigcoro, libxev, zio in one grid. Problem: a language runtime and an event loop were compared as if they were the same kind of peer. Now: 5.1 languages, 5.2 Zig libraries.
+- **C++ / Rust harness.** Was: C++ `mutex`+`queue`+`notify_all`, capacity 0 coerced to 1, skynet as 10k OS threads; Rust skynet as `std::thread`. Problem: the numbers measured the worst possible implementation, not a serious peer, and reviewers called the benches unsafe/slow. Now: C++ helping pool + ring/`rendezvous` `Chan` + `TCP_NODELAY` + UDP recv timeout; Rust skynet is `tokio::spawn` (`Send` future). Re-measured in 5.1 (Rust skynet **45.5k → 219 ns**, C++ TCP **54.9k → 67.6k** RT/s).
+- **Peer name matrix.** Was: zigcoro/libxev/zio only printed the primitives they own; most rows were `n/a`. Problem: a missing cell looks like “we hid a loss,” and you cannot scan one name across every peer. Now: every workload name is printed. Stand-ins are tagged (`(q)`, `(FIFO)`, `(thread)`, …) and never bolded. zio covers the full runtime surface; zigcoro I/O is blocking Winsock; libxev fiber/channel/sync names are queues and loops.
+
+#### Benches sped up
+
+
+| Workload | Before | After | What was wrong | What we did |
+|----------|-------:|------:|----------------|-------------|
+| `skynet_join_10k` | 22.8k ns | **404 ns** | 10k stackful leaves + 1 worker | `spawnLeaf` + work-stealing |
+| `chan_create_buf8` cold | 10.1k ns | **20.9 ns** | 2 mallocs + `close()` + DebugAllocator | single alloc, skip unused close, `smp_allocator` |
+| `chan_create_buf8_pooled` | 28.7 ns | **20.3 ns** | extra reset/`close` on recycle | cheaper unused destroy |
+| `timer_many_100k_dispatch` | 1197 ns | **761 ns** | 1–1000 ns sleep sat on a 1 ms wheel; 99k stacks hit `HeapFree` | sub-tick yield; pool cap 131072 |
+| `timer_sleep_batch` | 798 ns | **471 ns** | same 1 ms quantization (`sleep(50)` was 50 ns) | sub-tick yield |
+| `priority_dispatch` | 539 ns | **284 ns** | spawn/heap path paid DebugAllocator + small pool | `smp_allocator` + larger stack cache |
+| `select_fanin_2` | 55.4 ns | **26.3 ns** | lock + DebugAllocator noise on the wait path | MPMC ring; harness allocator |
+| `select_sync_contended` | 68.5 ns | **30.1 ns** | same | same |
+| `tcp_pingpong` (io_uring) | n/a | **321k RT/s** | Linux did not build; no e2e | 0.17 syscalls + WSL2 5.15 |
+| `udp_ping` (io_uring) | n/a | **1651k pkt/s** | same | same |

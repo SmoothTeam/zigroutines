@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -39,8 +43,8 @@ fn fiberReturned() callconv(.c) noreturn {
 }
 
 pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
-    if (stack.len < 2048) {
-        @panic("zigroutines: stack too small (need at least 2KiB)");
+    if (stack.len < 512) {
+        @panic("zigroutines: stack too small (need at least 512B after context)");
     }
 
     var top: usize = @intFromPtr(stack.ptr) + stack.len;

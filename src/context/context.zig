@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -43,6 +47,15 @@ pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
 pub fn swap(from: *Context, to: *Context) void {
     if (comptime !supported) @compileError("context.swap: unsupported target");
     arch_impl.swap(from, to);
+}
+
+pub fn swapFiber(from: *Context, to: *Context) void {
+    if (comptime !supported) @compileError("context.swapFiber: unsupported target");
+    if (@hasDecl(arch_impl, "swapFiber")) {
+        arch_impl.swapFiber(from, to);
+    } else {
+        arch_impl.swap(from, to);
+    }
 }
 
 pub fn isInitialized(ctx: *const Context) bool {

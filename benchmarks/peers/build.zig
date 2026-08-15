@@ -1,26 +1,37 @@
 const std = @import("std");
 
+const libxev_url = "https://github.com/mitchellh/libxev";
+const libxev_commit = "9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf";
+const zigcoro_url = "https://github.com/rsepassi/zigcoro";
+const zigcoro_commit = "5fccda31deb16f11616f1e2572d2704b1c5a4b03";
+const zio_url = "https://github.com/lalinsky/zio";
+const zio_commit = "550e459e7b4125e2b3ed48b870ab62382d094377";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const libxev_dep = b.dependency("libxev", .{
+    ensurePeer(b, "libxev", libxev_url, libxev_commit);
+    ensurePeer(b, "zigcoro", zigcoro_url, zigcoro_commit);
+    ensurePeer(b, "zio", zio_url, zio_commit);
+    applyPeerFixes(b);
+
+    const xev = b.createModule(.{
+        .root_source_file = b.path(".peer-src/libxev/src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
-    const xev = libxev_dep.module("xev");
 
     const coro_options = b.addOptions();
     coro_options.addOption(usize, "default_stack_size", 4 * 1024);
     coro_options.addOption(usize, "debug_log_level", 0);
-    const coro_options_mod = coro_options.createModule();
-
     const libcoro = b.createModule(.{
         .root_source_file = b.path("libcoro_root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "libcoro_options", .module = coro_options_mod },
+            .{ .name = "libcoro_options", .module = coro_options.createModule() },
         },
     });
 
@@ -30,15 +41,13 @@ pub fn build(b: *std.Build) void {
     zio_options.addOption(bool, "no_hacks", false);
     zio_options.addOption(bool, "task_migration", true);
     zio_options.addOption(bool, "scheduler_metrics", false);
-    const zio_options_mod = zio_options.createModule();
-
     const zio = b.createModule(.{
-        .root_source_file = b.path("deps/zio/src/zio.zig"),
+        .root_source_file = b.path(".peer-src/zio/src/zio.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "zio_options", .module = zio_options_mod },
+            .{ .name = "zio_options", .module = zio_options.createModule() },
         },
     });
 
@@ -48,10 +57,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // zigcoro
-    const coro_exe = b.addExecutable(.{
-        .name = "bench-zigcoro",
-        .root_module = b.createModule(.{
+    const want_zigcoro = b.option(bool, "zigcoro", "Build the zigcoro peer (upstream needs a 0.17 port)") orelse false;
+    if (want_zigcoro) {
+        const coro_mod = b.createModule(.{
             .root_source_file = b.path("zigcoro_bench.zig"),
             .target = target,
             .optimize = optimize,
@@ -60,13 +68,19 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "libcoro", .module = libcoro },
                 .{ .name = "common", .module = common },
             },
-        }),
-    });
-    b.installArtifact(coro_exe);
-    const run_coro = b.addRunArtifact(coro_exe);
-    b.step("run-zigcoro", "Run zigcoro peer benches").dependOn(&run_coro.step);
+        });
+        if (target.result.os.tag == .windows) {
+            coro_mod.linkSystemLibrary("ws2_32", .{});
+        }
+        const coro_exe = b.addExecutable(.{
+            .name = "bench-zigcoro",
+            .root_module = coro_mod,
+        });
+        b.installArtifact(coro_exe);
+        const run_coro = b.addRunArtifact(coro_exe);
+        b.step("run-zigcoro", "Run zigcoro peer benches").dependOn(&run_coro.step);
+    }
 
-    // libxev
     const xev_mod = b.createModule(.{
         .root_source_file = b.path("libxev_bench.zig"),
         .target = target,
@@ -89,7 +103,6 @@ pub fn build(b: *std.Build) void {
     const run_xev = b.addRunArtifact(xev_exe);
     b.step("run-libxev", "Run libxev peer benches").dependOn(&run_xev.step);
 
-    // zio
     const zio_root = b.createModule(.{
         .root_source_file = b.path("zio_bench.zig"),
         .target = target,
@@ -112,8 +125,61 @@ pub fn build(b: *std.Build) void {
     const run_zio = b.addRunArtifact(zio_exe);
     b.step("run-zio", "Run zio peer benches").dependOn(&run_zio.step);
 
-    const all = b.step("run-all", "Run all peer benches");
-    all.dependOn(&run_coro.step);
+    const all = b.step("run-all", "Run libxev and zio peer benches");
     all.dependOn(&run_xev.step);
     all.dependOn(&run_zio.step);
+}
+
+fn ensurePeer(b: *std.Build, name: []const u8, url: []const u8, commit: []const u8) void {
+    const dest = b.root.joinString(b.allocator, b.fmt(".peer-src/{s}", .{name})) catch @panic("OOM");
+    const ready = b.pathJoin(&.{ dest, "build.zig" });
+    if (fileExists(b, ready)) return;
+
+    const parent = b.root.joinString(b.allocator, ".peer-src") catch @panic("OOM");
+    std.Io.Dir.cwd().createDirPath(b.graph.io, parent) catch @panic("cannot create .peer-src");
+    b.graph.poisonCache();
+    std.debug.print("cloning {s} ({s})…\n", .{ name, commit[0..@min(commit.len, 12)] });
+    runGit(b, &.{ "git", "clone", "--filter=blob:none", url, dest });
+    runGit(b, &.{ "git", "-C", dest, "-c", "advice.detachedHead=false", "checkout", "--detach", commit });
+}
+
+fn applyPeerFixes(b: *std.Build) void {
+    const files = [_][]const u8{
+        ".peer-src/libxev/src/backend/io_uring.zig",
+        ".peer-src/libxev/src/queue.zig",
+        ".peer-src/libxev/src/queue_mpsc.zig",
+        ".peer-src/libxev/src/watcher/tcp.zig",
+        ".peer-src/zigcoro/src/coro.zig",
+    };
+    const io = b.graph.io;
+    const cwd = std.Io.Dir.cwd();
+    for (files) |rel| {
+        const path = b.root.joinString(b.allocator, rel) catch continue;
+        const data = cwd.readFileAlloc(io, path, b.allocator, .limited(8 * 1024 * 1024)) catch continue;
+        if (std.mem.indexOf(u8, data, " ** ") == null) continue;
+        const replaced = std.mem.replaceOwned(u8, b.allocator, data, " ** ", "**") catch continue;
+        var file = cwd.createFile(io, path, .{}) catch continue;
+        defer file.close(io);
+        var w = file.writer(io, &.{});
+        w.interface.writeAll(replaced) catch {};
+        w.interface.flush() catch {};
+    }
+}
+
+fn fileExists(b: *std.Build, path: []const u8) bool {
+    std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
+    return true;
+}
+
+fn runGit(b: *std.Build, argv: []const []const u8) void {
+    const result = std.process.run(b.allocator, b.graph.io, .{ .argv = argv }) catch |err| {
+        std.debug.print("peer benches need git on PATH ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+    if (!result.term.success()) {
+        std.debug.print("{s}\n", .{result.stderr});
+        std.process.exit(1);
+    }
 }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -54,8 +58,8 @@ fn fiberReturned() callconv(.c) noreturn {
 }
 
 pub fn make(ctx: *Context, stack: []u8, entry: Entry, arg: *anyopaque) void {
-    if (stack.len < 2048) {
-        @panic("zigroutines: stack too small (need at least 2KiB)");
+    if (stack.len < 512) {
+        @panic("zigroutines: stack too small (need at least 512B after context)");
     }
 
     var top: usize = @intFromPtr(stack.ptr) + stack.len;
@@ -109,8 +113,17 @@ pub fn swap(from: *Context, to: *Context) void {
     }
 }
 
+pub fn swapFiber(from: *Context, to: *Context) void {
+    if (comptime is_windows) {
+        swapWindowsFiber(from, to);
+    } else {
+        swapLinux(from, to);
+    }
+}
+
 fn swapLinux(from: *Context, to: *Context) callconv(.c) void {
     asm volatile (
+        \\ movq %[to], %%r11
         \\ leaq 1f(%%rip), %%rax
         \\ movq %%rax, 0(%[from])
         \\ movq %%rsp, 8(%[from])
@@ -120,14 +133,14 @@ fn swapLinux(from: *Context, to: *Context) callconv(.c) void {
         \\ movq %%r13, 40(%[from])
         \\ movq %%r14, 48(%[from])
         \\ movq %%r15, 56(%[from])
-        \\ movq 56(%[to]), %%r15
-        \\ movq 48(%[to]), %%r14
-        \\ movq 40(%[to]), %%r13
-        \\ movq 32(%[to]), %%r12
-        \\ movq 24(%[to]), %%rbx
-        \\ movq 16(%[to]), %%rbp
-        \\ movq 8(%[to]), %%rsp
-        \\ jmpq *0(%[to])
+        \\ movq 56(%%r11), %%r15
+        \\ movq 48(%%r11), %%r14
+        \\ movq 40(%%r11), %%r13
+        \\ movq 32(%%r11), %%r12
+        \\ movq 24(%%r11), %%rbx
+        \\ movq 16(%%r11), %%rbp
+        \\ movq 8(%%r11), %%rsp
+        \\ jmpq *0(%%r11)
         \\ 1:
         :
         : [from] "r" (from),
@@ -138,6 +151,57 @@ fn swapLinux(from: *Context, to: *Context) callconv(.c) void {
           .rdx = true,
           .rsi = true,
           .rdi = true,
+          .r8 = true,
+          .r9 = true,
+          .r10 = true,
+          .r11 = true,
+          .memory = true,
+        });
+}
+
+fn swapWindowsFiber(from: *Context, to: *Context) callconv(.c) void {
+    asm volatile (
+        \\ movq %[to], %%r11
+        \\ leaq 1f(%%rip), %%rax
+        \\ movq %%rax, 0(%[from])
+        \\ movq %%rsp, 8(%[from])
+        \\ movq %%rbp, 16(%[from])
+        \\ movq %%rbx, 24(%[from])
+        \\ movq %%r12, 32(%[from])
+        \\ movq %%r13, 40(%[from])
+        \\ movq %%r14, 48(%[from])
+        \\ movq %%r15, 56(%[from])
+        \\ movq %%rdi, 64(%[from])
+        \\ movq %%rsi, 72(%[from])
+        \\ movq %%gs:0x30, %%r10
+        \\ movq 0x1478(%%r10), %%rax
+        \\ movq %%rax, 248(%[from])
+        \\ movq 0x10(%%r10), %%rax
+        \\ movq %%rax, 256(%[from])
+        \\ movq 0x08(%%r10), %%rax
+        \\ movq %%rax, 264(%[from])
+        \\ movq 264(%%r11), %%rax
+        \\ movq %%rax, 0x08(%%r10)
+        \\ movq 256(%%r11), %%rax
+        \\ movq %%rax, 0x10(%%r10)
+        \\ movq 248(%%r11), %%rax
+        \\ movq %%rax, 0x1478(%%r10)
+        \\ movq 56(%%r11), %%r15
+        \\ movq 48(%%r11), %%r14
+        \\ movq 40(%%r11), %%r13
+        \\ movq 32(%%r11), %%r12
+        \\ movq 24(%%r11), %%rbx
+        \\ movq 16(%%r11), %%rbp
+        \\ movq 8(%%r11), %%rsp
+        \\ jmpq *0(%%r11)
+        \\ 1:
+        :
+        : [from] "r" (from),
+          [to] "r" (to),
+        : .{
+          .rax = true,
+          .rcx = true,
+          .rdx = true,
           .r8 = true,
           .r9 = true,
           .r10 = true,

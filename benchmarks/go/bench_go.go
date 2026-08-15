@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -33,9 +35,11 @@ func printThroughput(name string, ops int, dt time.Duration, unit string) {
 func main() {
 	fmt.Printf("go bench  go=%s  GOMAXPROCS=%d\n", runtime.Version(), runtime.GOMAXPROCS(0))
 	fmt.Println("--- fiber / spawn ---")
+	benchCtxSwitchBounce()
 	benchYieldPingPong()
 	benchYieldSingle()
 	benchYieldWS4()
+	benchLeafSpawn()
 	benchSpawnJoin()
 	benchSpawnResultJoin()
 	benchNurseryJoin()
@@ -72,8 +76,46 @@ func main() {
 	benchTimerSleepBatch()
 	benchManyTimers()
 
+	fmt.Println("--- io ---")
+	benchTcpPingPong()
+	benchUdpPing()
+
 	fmt.Println("---")
 	fmt.Println("done")
+}
+
+func benchCtxSwitchBounce() {
+	const n = 400_000
+	ch := make(chan struct{})
+	done := make(chan struct{})
+	t0 := time.Now()
+	go func() {
+		for i := 0; i < n; i++ {
+			ch <- struct{}{}
+			<-ch
+		}
+		close(done)
+	}()
+	go func() {
+		for i := 0; i < n; i++ {
+			<-ch
+			ch <- struct{}{}
+		}
+	}()
+	<-done
+	printRate("ctx_switch_bounce", n*2, time.Since(t0))
+}
+
+func benchLeafSpawn() {
+	const n = 50_000
+	t0 := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() { wg.Done() }()
+	}
+	wg.Wait()
+	printRate("leaf_spawn_batch", n, time.Since(t0))
 }
 
 func benchYieldPingPong() {
@@ -620,4 +662,109 @@ func benchManyTimers() {
 	printRate("timer_many_100k_dispatch", n, time.Since(t0))
 }
 
-var _ = printThroughput
+func benchTcpPingPong() {
+	const rounds = 20_000
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Printf("tcp_pingpong: skip (%v)\n", err)
+		return
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		c, accErr := ln.Accept()
+		if accErr != nil {
+			errCh <- accErr
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 64)
+		for {
+			n, readErr := c.Read(buf)
+			if readErr != nil || n == 0 {
+				errCh <- nil
+				return
+			}
+			if _, writeErr := c.Write(buf[:n]); writeErr != nil {
+				errCh <- writeErr
+				return
+			}
+		}
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		fmt.Printf("tcp_pingpong: skip (%v)\n", err)
+		return
+	}
+	msg := []byte("PING\n")
+	buf := make([]byte, len(msg))
+	t0 := time.Now()
+	completed := 0
+	for i := 0; i < rounds; i++ {
+		if _, err = c.Write(msg); err != nil {
+			break
+		}
+		if _, err = io.ReadFull(c, buf); err != nil {
+			break
+		}
+		completed++
+	}
+	dt := time.Since(t0)
+	_ = c.Close()
+	<-errCh
+	if completed == 0 {
+		fmt.Println("tcp_pingpong: failed (0 roundtrips)")
+		return
+	}
+	printThroughput("tcp_pingpong", completed, dt, "roundtrips")
+	printRate("tcp_pingpong_latency", completed, dt)
+}
+
+func benchUdpPing() {
+	const rounds = 10_000
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		fmt.Printf("udp_ping: skip (%v)\n", err)
+		return
+	}
+	defer srv.Close()
+
+	cli, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		fmt.Printf("udp_ping: skip (%v)\n", err)
+		return
+	}
+	defer cli.Close()
+
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 32)
+		for i := 0; i < rounds; i++ {
+			if _, _, readErr := srv.ReadFromUDP(buf); readErr != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	payload := []byte("PING")
+	dst := srv.LocalAddr()
+	t0 := time.Now()
+	completed := 0
+	for i := 0; i < rounds; i++ {
+		if _, err = cli.WriteTo(payload, dst); err != nil {
+			break
+		}
+		completed++
+	}
+	<-done
+	dt := time.Since(t0)
+	if completed == 0 {
+		fmt.Println("udp_ping: failed (0 packets)")
+		return
+	}
+	printThroughput("udp_ping", completed, dt, "pkts")
+	printRate("udp_ping_latency", completed, dt)
+}

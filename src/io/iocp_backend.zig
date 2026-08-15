@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 const be = @import("io_backend.zig");
@@ -7,6 +11,16 @@ const sync = @import("../core/synchronization.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
+const IoRequest = struct {
+    ov: @import("../utils/windows_api.zig").OVERLAPPED = .{},
+    task: *task_mod.Task,
+    handle: be.Handle = 0,
+    done: bool = false,
+    parked: bool = false,
+    bytes: u32 = 0,
+    err: ?be.BackendError = null,
+};
+
 pub const IocpBackend = struct {
     allocator: std.mem.Allocator,
     reactor: *reactor_mod.Reactor,
@@ -14,6 +28,10 @@ pub const IocpBackend = struct {
     iocp: if (is_windows) ?*anyopaque else void = if (is_windows) null else {},
     associated: if (is_windows) std.AutoHashMapUnmanaged(be.Handle, void) else void =
         if (is_windows) .{} else {},
+    pending: if (is_windows) std.ArrayListUnmanaged(*IoRequest) else void =
+        if (is_windows) .empty else {},
+    free_reqs: if (is_windows) std.ArrayListUnmanaged(*IoRequest) else void =
+        if (is_windows) .empty else {},
     async_enabled: bool = is_windows,
 
     pub fn create(allocator: std.mem.Allocator) !*IocpBackend {
@@ -37,6 +55,8 @@ pub const IocpBackend = struct {
             }
             self.iocp = h;
             self.associated = .{};
+            self.pending = .empty;
+            self.free_reqs = .empty;
             self.async_enabled = true;
             ensureWsa() catch {};
         }
@@ -44,8 +64,16 @@ pub const IocpBackend = struct {
     }
 
     pub fn destroy(self: *IocpBackend) void {
+        self.cancelAll();
         if (comptime is_windows) {
             const win = @import("../utils/windows_api.zig");
+            var spins: u32 = 0;
+            while (spins < 8) : (spins += 1) {
+                if ((self.drainCompletions(0) catch 0) == 0) break;
+            }
+            for (self.free_reqs.items) |r| self.allocator.destroy(r);
+            self.free_reqs.deinit(self.allocator);
+            self.pending.deinit(self.allocator);
             self.associated.deinit(self.allocator);
             if (self.iocp) |h| {
                 _ = win.CloseHandle(h);
@@ -63,15 +91,63 @@ pub const IocpBackend = struct {
         };
     }
 
+    const wake_key: usize = std.math.maxInt(usize);
+
     const vtable = be.Backend.VTable{
         .deinit = deinitV,
         .wait = waitV,
         .poll = pollV,
         .associate = associateV,
+        .cancel_all = cancelAllV,
+        .wakeup = wakeupV,
         .async_read = if (is_windows) asyncReadV else null,
         .async_write = if (is_windows) asyncWriteV else null,
         .supports_async = supportsAsyncV,
     };
+
+    fn cancelAllV(ptr: *anyopaque) void {
+        const self: *IocpBackend = @ptrCast(@alignCast(ptr));
+        self.cancelAll();
+    }
+
+    fn wakeupV(ptr: *anyopaque) void {
+        const self: *IocpBackend = @ptrCast(@alignCast(ptr));
+        self.wakeup();
+    }
+
+    pub fn wakeup(self: *IocpBackend) void {
+        if (comptime !is_windows) {
+            self.reactor.poke();
+            return;
+        }
+        const win = @import("../utils/windows_api.zig");
+        if (self.iocp) |h| {
+            _ = win.PostQueuedCompletionStatus(h, 0, wake_key, null);
+        }
+        self.reactor.poke();
+    }
+
+    pub fn cancelAll(self: *IocpBackend) void {
+        self.reactor.cancelAll();
+        if (comptime !is_windows) return;
+        const win = @import("../utils/windows_api.zig");
+        var to_wake: std.ArrayListUnmanaged(*task_mod.Task) = .empty;
+        defer to_wake.deinit(self.allocator);
+
+        self.lock.lock();
+        for (self.pending.items) |req| {
+            _ = win.CancelIoEx(@ptrFromInt(req.handle), &req.ov);
+            if (!req.done) {
+                req.err = error.Closed;
+                req.done = true;
+                if (req.parked) to_wake.append(self.allocator, req.task) catch {};
+            }
+        }
+        self.pending.clearRetainingCapacity();
+        self.lock.unlock();
+        self.wakeup();
+        for (to_wake.items) |t| be.wakeTask(t);
+    }
 
     fn deinitV(ptr: *anyopaque) void {
         const self: *IocpBackend = @ptrCast(@alignCast(ptr));
@@ -80,7 +156,6 @@ pub const IocpBackend = struct {
 
     fn waitV(ptr: *anyopaque, handle: be.Handle, interest: be.Interest) be.BackendError!void {
         const self: *IocpBackend = @ptrCast(@alignCast(ptr));
-        try self.associateHandle(handle);
         return self.reactor.asBackend().wait(handle, interest);
     }
 
@@ -88,9 +163,14 @@ pub const IocpBackend = struct {
         const self: *IocpBackend = @ptrCast(@alignCast(ptr));
         var woken: usize = 0;
         if (comptime is_windows) {
-            woken += self.drainCompletions(timeout_ns) catch 0;
-            const t: u64 = if (woken > 0) 0 else timeout_ns;
-            woken += self.reactor.asBackend().poll(t) catch 0;
+            const need_ready = self.reactor.hasWaiters();
+            if (need_ready) {
+                woken += self.drainCompletions(0) catch 0;
+                const t: u64 = if (woken > 0) 0 else timeout_ns;
+                woken += self.reactor.asBackend().poll(t) catch 0;
+            } else {
+                woken += self.drainCompletions(timeout_ns) catch 0;
+            }
         } else {
             woken += self.reactor.asBackend().poll(timeout_ns) catch 0;
         }
@@ -119,15 +199,6 @@ pub const IocpBackend = struct {
         self.associated.put(self.allocator, handle, {}) catch return error.OutOfMemory;
     }
 
-    const IoRequest = struct {
-        ov: @import("../utils/windows_api.zig").OVERLAPPED = .{},
-        task: *task_mod.Task,
-        done: bool = false,
-        parked: bool = false,
-        bytes: u32 = 0,
-        err: ?be.BackendError = null,
-    };
-
     fn asyncReadV(ptr: *anyopaque, handle: be.Handle, buf: []u8) be.BackendError!usize {
         const self: *IocpBackend = @ptrCast(@alignCast(ptr));
         return self.asyncRead(handle, buf);
@@ -140,17 +211,101 @@ pub const IocpBackend = struct {
 
     fn asyncRead(self: *IocpBackend, handle: be.Handle, buf: []u8) be.BackendError!usize {
         if (comptime !is_windows) return error.Unsupported;
-        try self.associateHandle(handle);
         const me = task_mod.current() orelse @panic("zigroutines: async_read outside task");
 
-        var req = IoRequest{ .task = me };
+        const req = try self.acquireReq(me, handle);
+        errdefer self.releaseReq(req);
+
+        const issued = issueRecv(handle, buf, req);
+        if (issued) |n| {
+            self.releaseReq(req);
+            return n;
+        } else |err| switch (err) {
+            error.WouldBlock => {},
+            else => {
+                self.releaseReq(req);
+                return err;
+            },
+        }
+
+        self.lock.lock();
+        self.pending.append(self.allocator, req) catch {};
+        req.parked = true;
+        const already = req.done;
+        self.lock.unlock();
+        if (!already) {
+            const ex = me.executor orelse @panic("zigroutines: async_read without executor");
+            ex.parkFromRunning(.io);
+        }
+
+        self.removePending(req);
+        const result: be.BackendError!usize = if (req.err) |e| e else if (!req.done) error.Unexpected else req.bytes;
+        self.releaseReq(req);
+        return result;
+    }
+
+    fn asyncWrite(self: *IocpBackend, handle: be.Handle, buf: []const u8) be.BackendError!usize {
+        if (comptime !is_windows) return error.Unsupported;
+        const me = task_mod.current() orelse @panic("zigroutines: async_write outside task");
+
+        const req = try self.acquireReq(me, handle);
+        errdefer self.releaseReq(req);
+
+        const issued = issueSend(handle, buf, req);
+        if (issued) |n| {
+            self.releaseReq(req);
+            return n;
+        } else |err| switch (err) {
+            error.WouldBlock => {},
+            else => {
+                self.releaseReq(req);
+                return err;
+            },
+        }
+
+        self.lock.lock();
+        self.pending.append(self.allocator, req) catch {};
+        req.parked = true;
+        const already = req.done;
+        self.lock.unlock();
+        if (!already) {
+            const ex = me.executor orelse @panic("zigroutines: async_write without executor");
+            ex.parkFromRunning(.io);
+        }
+
+        self.removePending(req);
+        const result: be.BackendError!usize = if (req.err) |e| e else if (!req.done) error.Unexpected else req.bytes;
+        self.releaseReq(req);
+        return result;
+    }
+
+    fn acquireReq(self: *IocpBackend, task: *task_mod.Task, handle: be.Handle) !*IoRequest {
+        self.lock.lock();
+        const reused = self.free_reqs.pop();
+        self.lock.unlock();
+        const req = reused orelse (self.allocator.create(IoRequest) catch return error.OutOfMemory);
+        req.* = .{ .task = task, .handle = handle };
+        return req;
+    }
+
+    fn releaseReq(self: *IocpBackend, req: *IoRequest) void {
+        req.* = .{ .task = req.task, .handle = 0 };
+        self.lock.lock();
+        self.free_reqs.append(self.allocator, req) catch {
+            self.lock.unlock();
+            self.allocator.destroy(req);
+            return;
+        };
+        self.lock.unlock();
+    }
+
+    fn issueRecv(handle: be.Handle, buf: []u8, req: *IoRequest) be.BackendError!usize {
         var wsabuf = WSABUF{
             .len = @intCast(@min(buf.len, std.math.maxInt(u32))),
             .buf = buf.ptr,
         };
         var flags: u32 = 0;
         var transferred: u32 = 0;
-
         const rc = WSARecv(
             handle,
             @as([*]WSABUF, @ptrCast(&wsabuf)),
@@ -160,38 +315,20 @@ pub const IocpBackend = struct {
             @ptrCast(&req.ov),
             null,
         );
-
-        if (rc == 0) {
-            return transferred;
-        }
+        if (rc == 0) return transferred;
         const err = WSAGetLastError();
-        if (err != WSA_IO_PENDING) {
-            if (err == WSAECONNRESET) return error.ConnectionReset;
-            return error.Unexpected;
-        }
-
-        req.parked = true;
-        const ex = me.executor orelse @panic("zigroutines: async_read without executor");
-        ex.parkFromRunning(.io);
-
-        if (req.err) |e| return e;
-        if (!req.done) return error.Unexpected;
-        return req.bytes;
+        if (err == WSA_IO_PENDING) return error.WouldBlock;
+        if (err == WSAECONNRESET) return error.ConnectionReset;
+        return error.Unexpected;
     }
 
-    fn asyncWrite(self: *IocpBackend, handle: be.Handle, buf: []const u8) be.BackendError!usize {
-        if (comptime !is_windows) return error.Unsupported;
-        try self.associateHandle(handle);
-        const me = task_mod.current() orelse @panic("zigroutines: async_write outside task");
-
-        var req = IoRequest{ .task = me };
+    fn issueSend(handle: be.Handle, buf: []const u8, req: *IoRequest) be.BackendError!usize {
         var wsabuf = WSABUF{
             .len = @intCast(@min(buf.len, std.math.maxInt(u32))),
             .buf = @constCast(buf.ptr),
         };
         var transferred: u32 = 0;
         const flags: u32 = 0;
-
         const rc = WSASend(
             handle,
             @as([*]WSABUF, @ptrCast(&wsabuf)),
@@ -201,23 +338,23 @@ pub const IocpBackend = struct {
             @ptrCast(&req.ov),
             null,
         );
-
-        if (rc == 0) {
-            return transferred;
-        }
+        if (rc == 0) return transferred;
         const err = WSAGetLastError();
-        if (err != WSA_IO_PENDING) {
-            if (err == WSAECONNRESET) return error.ConnectionReset;
-            return error.Unexpected;
+        if (err == WSA_IO_PENDING) return error.WouldBlock;
+        if (err == WSAECONNRESET) return error.ConnectionReset;
+        return error.Unexpected;
+    }
+
+    fn removePending(self: *IocpBackend, req: *IoRequest) void {
+        if (comptime !is_windows) return;
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.pending.items, 0..) |p, i| {
+            if (p == req) {
+                _ = self.pending.swapRemove(i);
+                return;
+            }
         }
-
-        req.parked = true;
-        const ex = me.executor orelse @panic("zigroutines: async_write without executor");
-        ex.parkFromRunning(.io);
-
-        if (req.err) |e| return e;
-        if (!req.done) return error.Unexpected;
-        return req.bytes;
     }
 
     fn drainCompletions(self: *IocpBackend, timeout_ns: u64) be.BackendError!usize {
@@ -247,11 +384,19 @@ pub const IocpBackend = struct {
         var woken: usize = 0;
         var i: u32 = 0;
         while (i < removed) : (i += 1) {
+            if (entries[i].lpCompletionKey == wake_key) continue;
             const ov_ptr = entries[i].lpOverlapped orelse continue;
             const req: *IoRequest = @fieldParentPtr("ov", ov_ptr);
+            self.lock.lock();
+            if (req.handle == 0 or req.done) {
+                self.lock.unlock();
+                continue;
+            }
             req.bytes = entries[i].dwNumberOfBytesTransferred;
             req.done = true;
-            if (req.parked) {
+            const parked = req.parked;
+            self.lock.unlock();
+            if (parked) {
                 be.wakeTask(req.task);
                 woken += 1;
             }

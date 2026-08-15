@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 
 pub const MEM_COMMIT: u32 = 0x1000;
@@ -73,5 +77,10 @@ pub const OVERLAPPED_ENTRY = extern struct {
     Internal: usize = 0,
     dwNumberOfBytesTransferred: u32 = 0,
 };
+
+pub extern "kernel32" fn CancelIoEx(
+    hFile: ?*anyopaque,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) u32;
 
 pub const INVALID_HANDLE_VALUE: ?*anyopaque = @ptrFromInt(std.math.maxInt(usize));

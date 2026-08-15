@@ -14,6 +14,7 @@ pub fn runAll(alloc: std.mem.Allocator) !void {
     try nurseryJoin(alloc);
     try nTasksScale(alloc);
     try skynetJoin(alloc);
+    try stackProtectDensity(alloc);
 }
 
 fn pureCtxSwitchBounce(alloc: std.mem.Allocator) !void {
@@ -294,8 +295,10 @@ fn nTasksScale(alloc: std.mem.Allocator) !void {
 fn skynetJoin(alloc: std.mem.Allocator) !void {
     const size: usize = 10_000;
     var rt = try zr.Runtime.init(alloc, .{
-        .workers = 1,
+        .workers = 0,
+        .policy = .work_stealing,
         .stack_pool = true,
+        .task_freelist = true,
     });
     defer rt.deinit();
 
@@ -308,7 +311,8 @@ fn skynetJoin(alloc: std.mem.Allocator) !void {
             var i: usize = 0;
             var handles: [div]zr.TypedJoinHandle(usize) = undefined;
             while (i < div) : (i += 1) {
-                handles[i] = r.spawnResult(.{}, skynet, .{ r, num + i * next, next }) catch {
+                const opts: zr.SpawnOptions = .{ .mode = if (next == 1) .leaf else .stackful };
+                handles[i] = r.spawnResult(opts, skynet, .{ r, num + i * next, next }) catch {
                     return sum;
                 };
             }
@@ -333,3 +337,75 @@ fn skynetJoin(alloc: std.mem.Allocator) !void {
     common.printRate("skynet_join_10k", total_spawns, t1 - t0);
     std.mem.doNotOptimizeAway(result);
 }
+
+fn stackProtectDensity(alloc: std.mem.Allocator) !void {
+    const n: usize = 10_000;
+    try reportStackProtect("none", alloc, .none, n);
+    try reportStackProtect("canary", alloc, .canary, n);
+    try reportStackProtect("guard", alloc, .guard, n);
+
+    var pool = zr.stack.Pool.initWith(alloc, .{ .protect = .guard });
+    defer pool.deinit();
+    const warmup = try pool.acquire(0);
+    pool.release(warmup);
+    const t0 = common.nowNs();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const s = try pool.acquire(0);
+        pool.release(s);
+    }
+    const t1 = common.nowNs();
+    common.printRate("spawn_guard_reuse", n, t1 - t0);
+}
+
+fn reportStackProtect(tag: []const u8, alloc: std.mem.Allocator, protect: zr.StackProtect, n: usize) !void {
+    var pool = zr.stack.Pool.initWith(alloc, .{ .protect = protect });
+    defer pool.deinit();
+    const stacks = try alloc.alloc(zr.stack.Stack, n);
+    defer alloc.free(stacks);
+
+    const ws0 = workingSetBytes();
+    for (stacks) |*s| {
+        s.* = try pool.acquire(0);
+        if (s.usable.len != 0) s.usable[s.usable.len - 1] = 1;
+    }
+    const ws1 = workingSetBytes();
+    for (stacks) |s| pool.release(s);
+
+    const delta = if (ws1 > ws0) ws1 - ws0 else 0;
+    const per = if (n == 0) 0 else delta / n;
+    std.debug.print("rss_stacks_{s}_{d}: working_set_delta={d} B  (~{d} B/stack, page_granule={d})\n", .{
+        tag,
+        n,
+        delta,
+        per,
+        zr.stack.page_size,
+    });
+}
+
+fn workingSetBytes() usize {
+    if (comptime @import("builtin").os.tag != .windows) return 0;
+    var pmc: ProcessMemoryCounters = .{
+        .cb = @sizeOf(ProcessMemoryCounters),
+    };
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(ProcessMemoryCounters)) == 0) {
+        return 0;
+    }
+    return pmc.WorkingSetSize;
+}
+
+const ProcessMemoryCounters = extern struct {
+    cb: u32 = 0,
+    PageFaultCount: u32 = 0,
+    PeakWorkingSetSize: usize = 0,
+    WorkingSetSize: usize = 0,
+    QuotaPeakPagedPoolUsage: usize = 0,
+    QuotaPagedPoolUsage: usize = 0,
+    QuotaPeakNonPagedPoolUsage: usize = 0,
+    QuotaNonPagedPoolUsage: usize = 0,
+    PagefileUsage: usize = 0,
+    PeakPagefileUsage: usize = 0,
+};
+
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn K32GetProcessMemoryInfo(process: ?*anyopaque, counters: *ProcessMemoryCounters, cb: u32) callconv(.winapi) i32;

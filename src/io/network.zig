@@ -1,7 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 const backend = @import("io_backend.zig");
 const task_mod = @import("../core/task.zig");
+const sys_posix = @import("../utils/sys_posix.zig");
 
 const Handle = backend.Handle;
 const Backend = backend.Backend;
@@ -66,11 +71,11 @@ pub const TcpListener = struct {
                 .port = std.mem.nativeToBig(u16, port),
                 .addr = std.mem.nativeToBig(u32, host_addr),
             };
-            std.posix.bind(@intCast(h), @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| switch (err) {
+            sys_posix.bind(@intCast(h), @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| switch (err) {
                 error.AddressInUse => return error.AddressInUse,
                 else => return error.Unexpected,
             };
-            std.posix.listen(@intCast(h), opts.backlog) catch return error.Unexpected;
+            sys_posix.listen(@intCast(h), opts.backlog) catch return error.Unexpected;
         }
 
         var actual = port;
@@ -162,6 +167,9 @@ pub const TcpStream = struct {
     }
 
     pub fn read(self: *TcpStream, buf: []u8) NetError!usize {
+        if (self.io.supportsAsync()) {
+            return self.io.asyncRead(self.handle, buf);
+        }
         while (true) {
             const n = onWorker(recvOnce, .{ self.handle, buf }) catch |err| switch (err) {
                 error.WouldBlock => {
@@ -177,13 +185,16 @@ pub const TcpStream = struct {
     pub fn writeAll(self: *TcpStream, data: []const u8) NetError!void {
         var sent: usize = 0;
         while (sent < data.len) {
-            const n = onWorker(sendOnce, .{ self.handle, data[sent..] }) catch |err| switch (err) {
-                error.WouldBlock => {
-                    try self.io.wait(self.handle, .write);
-                    continue;
-                },
-                else => |e| return e,
-            };
+            const n = if (self.io.supportsAsync())
+                try self.io.asyncWrite(self.handle, data[sent..])
+            else
+                onWorker(sendOnce, .{ self.handle, data[sent..] }) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        try self.io.wait(self.handle, .write);
+                        continue;
+                    },
+                    else => |e| return e,
+                };
             if (n == 0) return error.ConnectionReset;
             sent += n;
         }
@@ -196,7 +207,7 @@ fn createSocket() NetError!Handle {
         if (s == INVALID_SOCKET) return error.Unexpected;
         return s;
     } else {
-        const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return error.Unexpected;
+        const fd = sys_posix.socket(true) catch return error.Unexpected;
         return @intCast(fd);
     }
 }
@@ -206,7 +217,7 @@ fn closeHandle(h: Handle) void {
     if (comptime is_windows) {
         _ = closesocket(h);
     } else {
-        std.posix.close(@intCast(h));
+        sys_posix.closeFd(@intCast(h));
     }
 }
 
@@ -215,8 +226,7 @@ fn setNonBlocking(h: Handle) NetError!void {
         var mode: u32 = 1;
         if (ioctlsocket(h, FIONBIO, &mode) != 0) return error.Unexpected;
     } else {
-        const flags = std.posix.fcntl(@intCast(h), std.posix.F.GETFL, {}) catch return error.Unexpected;
-        _ = std.posix.fcntl(@intCast(h), std.posix.F.SETFL, flags | std.posix.O.NONBLOCK) catch return error.Unexpected;
+        sys_posix.setNonblock(@intCast(h)) catch return error.Unexpected;
     }
 }
 
@@ -241,7 +251,7 @@ fn acceptOnce(h: Handle) NetError!Handle {
         }
         return c;
     } else {
-        const c = std.posix.accept(@intCast(h), null, null) catch |err| switch (err) {
+        const c = sys_posix.accept(@intCast(h)) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return error.Unexpected,
         };
@@ -269,7 +279,7 @@ fn connectNonblockAddr(h: Handle, host_addr: u32, port: u16) NetError!void {
             .port = std.mem.nativeToBig(u16, port),
             .addr = std.mem.nativeToBig(u32, host_addr),
         };
-        std.posix.connect(@intCast(h), @ptrCast(&psa), @sizeOf(@TypeOf(psa))) catch |err| switch (err) {
+        sys_posix.connect(@intCast(h), @ptrCast(&psa), @sizeOf(@TypeOf(psa))) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.ConnectionRefused => return error.ConnectionRefused,
             else => return error.Unexpected,
@@ -286,7 +296,7 @@ fn getSockPort(h: Handle) NetError!u16 {
     } else {
         var sa: std.posix.sockaddr.in = undefined;
         var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        std.posix.getsockname(@intCast(h), @ptrCast(&sa), &len) catch return error.Unexpected;
+        sys_posix.getsockname(@intCast(h), @ptrCast(&sa), &len) catch return error.Unexpected;
         return std.mem.bigToNative(u16, sa.port);
     }
 }
@@ -300,8 +310,7 @@ fn checkConnectError(h: Handle) NetError!void {
         if (err_code == WSAECONNREFUSED) return error.ConnectionRefused;
         return error.Unexpected;
     } else {
-        var e: i32 = 0;
-        std.posix.getsockopt(@intCast(h), std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&e)) catch return error.Unexpected;
+        const e = sys_posix.getSoError(@intCast(h)) catch return error.Unexpected;
         if (e == 0) return;
         return error.ConnectionRefused;
     }
@@ -318,9 +327,9 @@ fn recvOnce(h: Handle, buf: []u8) NetError!usize {
         }
         return @intCast(n);
     } else {
-        const n = std.posix.recv(@intCast(h), buf, 0) catch |err| switch (err) {
+        const n = sys_posix.recv(@intCast(h), buf) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
-            error.ConnectionResetByPeer => return error.ConnectionReset,
+            error.ConnectionReset => return error.ConnectionReset,
             else => return error.Unexpected,
         };
         return n;
@@ -338,9 +347,9 @@ fn sendOnce(h: Handle, buf: []const u8) NetError!usize {
         }
         return @intCast(n);
     } else {
-        const n = std.posix.send(@intCast(h), buf, 0) catch |err| switch (err) {
+        const n = sys_posix.send(@intCast(h), buf) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
-            error.ConnectionResetByPeer => return error.ConnectionReset,
+            error.ConnectionReset => return error.ConnectionReset,
             else => return error.Unexpected,
         };
         return n;
@@ -398,7 +407,7 @@ pub const UdpSocket = struct {
                 .port = std.mem.nativeToBig(u16, port),
                 .addr = std.mem.nativeToBig(u32, opts.address.addr),
             };
-            std.posix.bind(@intCast(h), @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| switch (err) {
+            sys_posix.bind(@intCast(h), @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| switch (err) {
                 error.AddressInUse => return error.AddressInUse,
                 else => return error.Unexpected,
             };
@@ -407,7 +416,7 @@ pub const UdpSocket = struct {
         if (port == 0) {
             actual = getSockPort(h) catch port;
         }
-        io.associate(h) catch {};
+
         return .{ .handle = h, .io = io, .bound_port = actual };
     }
 
@@ -453,7 +462,7 @@ fn createUdpSocket() NetError!Handle {
         if (s == INVALID_SOCKET) return error.Unexpected;
         return s;
     } else {
-        const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return error.Unexpected;
+        const fd = sys_posix.socket(false) catch return error.Unexpected;
         return @intCast(fd);
     }
 }
@@ -479,7 +488,7 @@ fn sendToOnce(h: Handle, buf: []const u8, host_addr: u32, port: u16) NetError!us
             .port = std.mem.nativeToBig(u16, port),
             .addr = std.mem.nativeToBig(u32, host_addr),
         };
-        const n = std.posix.sendto(@intCast(h), buf, 0, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| switch (err) {
+        const n = sys_posix.sendto(@intCast(h), buf, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return error.Unexpected,
         };

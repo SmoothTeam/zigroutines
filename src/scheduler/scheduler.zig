@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 pub const fifo = @import("fifo_scheduler.zig");
 pub const work_stealing = @import("work_stealing_scheduler.zig");
 pub const priority = @import("priority_scheduler.zig");

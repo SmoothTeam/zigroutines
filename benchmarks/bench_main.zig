@@ -9,9 +9,7 @@ const timer_benches = @import("timer_benches.zig");
 const io_benches = @import("io_benches.zig");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .safety = false, .thread_safe = true }) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = std.heap.smp_allocator;
 
     std.debug.print("zigroutines bench  version={f}  (use -Doptimize=ReleaseFast)\n", .{zr.version});
     std.debug.print("--- fiber / spawn ---\n", .{});
@@ -29,7 +27,7 @@ pub fn main() !void {
     std.debug.print("--- timers ---\n", .{});
     try timer_benches.runAll(alloc);
 
-    std.debug.print("--- io (poll) ---\n", .{});
+    std.debug.print("--- io ---\n", .{});
     try io_benches.runAll(alloc);
 
     std.debug.print("---\ndone\n", .{});

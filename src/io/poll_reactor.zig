@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Apanazar
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 const std = @import("std");
 const builtin = @import("builtin");
 const task_mod = @import("../core/task.zig");
@@ -5,6 +9,7 @@ const sync = @import("../core/synchronization.zig");
 const backend = @import("io_backend.zig");
 const timer_mod = @import("../core/timer_queue.zig");
 const task_wake = @import("../utils/task_wake.zig");
+const sys_posix = @import("../utils/sys_posix.zig");
 
 const Handle = backend.Handle;
 const Interest = backend.Interest;
@@ -26,6 +31,10 @@ pub const Reactor = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     epoll_fd: if (is_linux) std.posix.fd_t else void = if (is_linux) -1 else {},
     wsa_started: bool = false,
+    wakeup_fd: Handle = 0,
+    wakeup_rd: Handle = 0,
+    wakeup_port: u16 = 0,
+    poller_blocked: std.atomic.Value(bool) = .init(false),
 
     pub fn create(allocator: std.mem.Allocator) !*Reactor {
         const self = try allocator.create(Reactor);
@@ -35,11 +44,15 @@ pub const Reactor = struct {
         if (comptime is_windows) {
             try ensureWsa();
             self.wsa_started = true;
+            initWakeupWindows(self) catch {};
         } else if (comptime is_linux) {
             const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
             const err = std.posix.errno(rc);
             if (err != .SUCCESS) return error.Unexpected;
             self.epoll_fd = @intCast(rc);
+            initWakeupLinux(self) catch {};
+        } else {
+            initWakeupPosix(self) catch {};
         }
 
         return self;
@@ -53,9 +66,11 @@ pub const Reactor = struct {
         self.entries.deinit(self.allocator);
         self.lock.unlock();
 
+        destroyWakeup(self);
+
         if (comptime is_linux) {
             if (self.epoll_fd >= 0) {
-                std.posix.close(self.epoll_fd);
+                sys_posix.closeFd(self.epoll_fd);
             }
         }
 
@@ -75,7 +90,40 @@ pub const Reactor = struct {
         .wait = waitV,
         .poll = pollV,
         .cancel_all = cancelAllV,
+        .wakeup = wakeupV,
     };
+
+    fn wakeupV(ptr: *anyopaque) void {
+        const self: *Reactor = @ptrCast(@alignCast(ptr));
+        self.poke();
+    }
+
+    pub fn hasWaiters(self: *Reactor) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.entries.items.len != 0;
+    }
+
+    pub fn poke(self: *Reactor) void {
+        if (!self.poller_blocked.load(.monotonic)) return;
+        if (self.wakeup_fd == 0) return;
+        if (comptime is_windows) {
+            var sa = sockaddr_in{
+                .sin_family = AF_INET,
+                .sin_port = std.mem.nativeToBig(u16, self.wakeup_port),
+                .sin_addr = std.mem.nativeToBig(u32, 0x7f000001),
+                .sin_zero = @splat(0),
+            };
+            var byte: [1]u8 = .{1};
+            _ = sendto(self.wakeup_fd, &byte, 1, 0, @ptrCast(&sa), @sizeOf(sockaddr_in));
+        } else if (comptime is_linux) {
+            var one: u64 = 1;
+            sys_posix.writeFd(@intCast(self.wakeup_fd), std.mem.asBytes(&one));
+        } else {
+            var byte: [1]u8 = .{1};
+            sys_posix.writeFd(@intCast(self.wakeup_fd), &byte);
+        }
+    }
 
     fn cancelAllV(ptr: *anyopaque) void {
         const self: *Reactor = @ptrCast(@alignCast(ptr));
@@ -129,6 +177,7 @@ pub const Reactor = struct {
         };
 
         try self.register(handle, &waiter);
+        self.poke();
 
         self.lock.lock();
         if (waiter.done) {
@@ -255,22 +304,14 @@ pub const Reactor = struct {
     fn pollWindows(self: *Reactor, timeout_ns: u64) BackendError!usize {
         self.lock.lock();
         const n = self.entries.items.len;
-        if (n == 0) {
+        if (n + @intFromBool(self.wakeup_fd != 0) > FD_SETSIZE) {
             self.lock.unlock();
-            if (timeout_ns > 0) {
-                std.Thread.yield() catch {};
-            }
-            return 0;
+            return error.Unexpected;
         }
 
         var handles: [FD_SETSIZE]Handle = undefined;
         var want_read: [FD_SETSIZE]bool = undefined;
         var want_write: [FD_SETSIZE]bool = undefined;
-        if (n > FD_SETSIZE) {
-            self.lock.unlock();
-            return error.Unexpected;
-        }
-
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const e = self.entries.items[i];
@@ -302,22 +343,33 @@ pub const Reactor = struct {
                 fdSet(h, &except_set);
             }
         }
+        if (self.wakeup_fd != 0) fdSet(self.wakeup_fd, &read_set);
+
+        if (read_set.fd_count == 0 and write_set.fd_count == 0) {
+            if (timeout_ns > 0) std.Thread.yield() catch {};
+            return 0;
+        }
 
         var tv: TimeVal = undefined;
-        const tv_ptr: ?*TimeVal = if (timeout_ns == 0) blk: {
-            tv = .{ .tv_sec = 0, .tv_usec = 0 };
-            break :blk &tv;
-        } else blk: {
+        const tv_ptr: ?*TimeVal = blk: {
             const ms = timeoutMs(timeout_ns);
             tv = .{
                 .tv_sec = @divTrunc(ms, 1000),
                 .tv_usec = @rem(ms, 1000) * 1000,
             };
+            if (timeout_ns == 0) {
+                tv = .{ .tv_sec = 0, .tv_usec = 0 };
+            }
             break :blk &tv;
         };
 
+        self.poller_blocked.store(true, .release);
         const rc = winSelect(0, &read_set, &write_set, &except_set, tv_ptr);
+        self.poller_blocked.store(false, .release);
         if (rc == SOCKET_ERROR) return error.Unexpected;
+        if (self.wakeup_fd != 0 and fdIsSet(self.wakeup_fd, &read_set)) {
+            drainWakeupWindows(self);
+        }
         if (rc == 0) return 0;
 
         var to_wake: std.ArrayListUnmanaged(*task_mod.Task) = .empty;
@@ -349,7 +401,9 @@ pub const Reactor = struct {
         var events: [64]std.os.linux.epoll_event = undefined;
         const timeout_ms = timeoutMs(timeout_ns);
 
+        self.poller_blocked.store(true, .release);
         const rc = std.os.linux.epoll_wait(self.epoll_fd, &events, events.len, timeout_ms);
+        self.poller_blocked.store(false, .release);
         const err = std.posix.errno(rc);
         if (err != .SUCCESS) {
             if (err == .INTR) return 0;
@@ -357,6 +411,8 @@ pub const Reactor = struct {
         }
         const n: usize = @intCast(rc);
         if (n == 0) return 0;
+
+        drainWakeupPosix(self);
 
         var to_wake: std.ArrayListUnmanaged(*task_mod.Task) = .empty;
         defer to_wake.deinit(self.allocator);
@@ -411,11 +467,12 @@ pub const Reactor = struct {
 
         self.lock.lock();
         const n = self.entries.items.len;
-        if (n == 0) {
+        const extra: usize = if (self.wakeup_rd != 0) 1 else 0;
+        if (n + extra == 0) {
             self.lock.unlock();
             return 0;
         }
-        var fds = self.allocator.alloc(std.posix.pollfd, n) catch {
+        var fds = self.allocator.alloc(std.posix.pollfd, n + extra) catch {
             self.lock.unlock();
             return error.OutOfMemory;
         };
@@ -435,10 +492,23 @@ pub const Reactor = struct {
                 .revents = 0,
             };
         }
+        if (extra != 0) {
+            fds[n] = .{
+                .fd = @intCast(self.wakeup_rd),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+        }
         self.lock.unlock();
 
         const timeout_ms = timeoutMs(timeout_ns);
-        _ = std.posix.poll(fds, timeout_ms) catch return error.Unexpected;
+        self.poller_blocked.store(true, .release);
+        _ = std.posix.poll(fds, timeout_ms) catch {
+            self.poller_blocked.store(false, .release);
+            return error.Unexpected;
+        };
+        self.poller_blocked.store(false, .release);
+        drainWakeupPosix(self);
 
         var to_wake: std.ArrayListUnmanaged(*task_mod.Task) = .empty;
         defer to_wake.deinit(self.allocator);
@@ -463,8 +533,13 @@ pub const Reactor = struct {
     }
 };
 
-const FD_SETSIZE: usize = 64;
 const SOCKET_ERROR: i32 = -1;
+const INVALID_SOCKET: Handle = @bitCast(@as(isize, -1));
+const AF_INET: u16 = 2;
+const SOCK_DGRAM: i32 = 2;
+const IPPROTO_UDP: i32 = 17;
+const FIONBIO: i32 = -2147195266;
+const FD_SETSIZE: usize = 256;
 
 const TimeVal = extern struct {
     tv_sec: i32,
@@ -480,23 +555,30 @@ fn fdZero(set: *FdSet) void {
     set.fd_count = 0;
 }
 
-fn fdSet(socket: Handle, set: *FdSet) void {
+fn fdSet(sock: Handle, set: *FdSet) void {
     if (set.fd_count >= FD_SETSIZE) return;
     var i: u32 = 0;
     while (i < set.fd_count) : (i += 1) {
-        if (set.fd_array[i] == socket) return;
+        if (set.fd_array[i] == sock) return;
     }
-    set.fd_array[set.fd_count] = socket;
+    set.fd_array[set.fd_count] = sock;
     set.fd_count += 1;
 }
 
-fn fdIsSet(socket: Handle, set: *const FdSet) bool {
+fn fdIsSet(sock: Handle, set: *const FdSet) bool {
     var i: u32 = 0;
     while (i < set.fd_count) : (i += 1) {
-        if (set.fd_array[i] == socket) return true;
+        if (set.fd_array[i] == sock) return true;
     }
     return false;
 }
+
+const sockaddr_in = extern struct {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: u32,
+    sin_zero: [8]u8 = @splat(0),
+};
 
 const WSAData = extern struct {
     wVersion: u16,
@@ -530,11 +612,93 @@ fn winSelect(
     return select(nfds, readfds, writefds, exceptfds, timeout);
 }
 
+extern "ws2_32" fn socket(af: i32, sock_type: i32, protocol: i32) callconv(WINAPI) Handle;
+extern "ws2_32" fn closesocket(s: Handle) callconv(WINAPI) i32;
+extern "ws2_32" fn ioctlsocket(s: Handle, cmd: i32, argp: *u32) callconv(WINAPI) i32;
+extern "ws2_32" fn bind(s: Handle, name: *const anyopaque, namelen: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn getsockname(s: Handle, name: *anyopaque, namelen: *i32) callconv(WINAPI) i32;
+extern "ws2_32" fn sendto(s: Handle, buf: [*]const u8, len: i32, flags: i32, to: *const anyopaque, tolen: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn recv(s: Handle, buf: [*]u8, len: i32, flags: i32) callconv(WINAPI) i32;
+
 fn ensureWsa() !void {
     if (comptime !is_windows) return;
     var data: WSAData = undefined;
     const rc = WSAStartup(0x0202, &data);
     if (rc != 0) return error.Unexpected;
+}
+
+fn initWakeupWindows(self: *Reactor) !void {
+    if (comptime !is_windows) return;
+    const s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return error.Unexpected;
+    errdefer _ = closesocket(s);
+    var mode: u32 = 1;
+    _ = ioctlsocket(s, FIONBIO, &mode);
+    var sa = sockaddr_in{
+        .sin_family = AF_INET,
+        .sin_port = 0,
+        .sin_addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .sin_zero = @splat(0),
+    };
+    if (bind(s, @ptrCast(&sa), @sizeOf(sockaddr_in)) != 0) return error.Unexpected;
+    var len: i32 = @sizeOf(sockaddr_in);
+    if (getsockname(s, @ptrCast(&sa), &len) != 0) return error.Unexpected;
+    self.wakeup_fd = s;
+    self.wakeup_rd = s;
+    self.wakeup_port = std.mem.bigToNative(u16, sa.sin_port);
+}
+
+fn drainWakeupWindows(self: *Reactor) void {
+    if (comptime !is_windows) return;
+    if (self.wakeup_fd == 0) return;
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = recv(self.wakeup_fd, &buf, buf.len, 0);
+        if (n <= 0) break;
+    }
+}
+
+fn initWakeupLinux(self: *Reactor) !void {
+    if (comptime !is_linux) return;
+    const rc = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+    const err = std.posix.errno(rc);
+    if (err != .SUCCESS) return error.Unexpected;
+    const fd: std.posix.fd_t = @intCast(rc);
+    self.wakeup_fd = @intCast(fd);
+    self.wakeup_rd = @intCast(fd);
+    var ev = std.os.linux.epoll_event{
+        .events = std.os.linux.EPOLL.IN,
+        .data = .{ .fd = fd },
+    };
+    _ = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &ev);
+}
+
+fn initWakeupPosix(self: *Reactor) !void {
+    if (comptime is_windows or is_linux) return;
+    const fds = sys_posix.pipe() catch return error.Unexpected;
+    self.wakeup_rd = @intCast(fds[0]);
+    self.wakeup_fd = @intCast(fds[1]);
+}
+
+fn drainWakeupPosix(self: *Reactor) void {
+    if (comptime is_windows) return;
+    if (self.wakeup_rd == 0) return;
+    var buf: [64]u8 = undefined;
+    sys_posix.readFd(@intCast(self.wakeup_rd), &buf);
+}
+
+fn destroyWakeup(self: *Reactor) void {
+    if (self.wakeup_fd == 0 and self.wakeup_rd == 0) return;
+    if (comptime is_windows) {
+        if (self.wakeup_fd != 0) _ = closesocket(self.wakeup_fd);
+    } else {
+        if (self.wakeup_rd != 0) sys_posix.closeFd(@intCast(self.wakeup_rd));
+        if (self.wakeup_fd != 0 and self.wakeup_fd != self.wakeup_rd) {
+            sys_posix.closeFd(@intCast(self.wakeup_fd));
+        }
+    }
+    self.wakeup_fd = 0;
+    self.wakeup_rd = 0;
 }
 
 comptime {
