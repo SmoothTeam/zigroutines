@@ -1,6 +1,16 @@
 version = 1
 
 [[annotations]]
-precedence = "aggregate"
+path = [".gitignore", "LICENSE", "README.md"]
+SPDX-FileCopyrightText = "2026 Apanazar"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = "examples/**"
+SPDX-FileCopyrightText = "2026 Apanazar"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = "benchmarks/**"
 SPDX-FileCopyrightText = "2026 Apanazar"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
