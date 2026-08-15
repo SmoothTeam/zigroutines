@@ -25,15 +25,12 @@ stress) is expected to cover.
 
 This repo is [REUSE](https://reuse.software/)-compliant and licensed by directory:
 
-- `src/*`, `tests/*`, `examples/*`, `include/*` — LGPL-3.0-or-later (SPDX header inline in each file)
+- `src/*`, `tests/*`, `include/*` — LGPL-3.0-or-later (SPDX header inline in each file)
 - `benchmarks/*` — LGPL-3.0-or-later (via `REUSE.toml`, no inline header)
-- `doc/*`, `README.md`, `CHANGELOG.md`, `.gitignore`, `LICENSE` — CC-BY-4.0 (via `REUSE.toml`)
+- `doc/*`, `examples/*`, `README.md`, `CHANGELOG.md`, `.gitignore`, `LICENSE` — CC-BY-4.0 (via
+  `REUSE.toml`, no inline header)
 
-`examples/*` also has a `CC-BY-4.0` entry in `REUSE.toml`, but it's currently shadowed by the inline
-LGPL header each example file carries — inline SPDX tags win over `REUSE.toml` annotations for the
-same file. Until that's resolved, treat `examples/*` as LGPL-3.0-or-later in practice.
-
-Every new source file under `src/`, `tests/`, `examples/`, or `include/` needs an SPDX header:
+Every new source file under `src/`, `tests/`, or `include/` needs an SPDX header:
 
 ```zig
 // SPDX-FileCopyrightText: <year> <your name>
@@ -41,9 +38,11 @@ Every new source file under `src/`, `tests/`, `examples/`, or `include/` needs a
 // SPDX-License-Identifier: LGPL-3.0-or-later
 ```
 
-For files where a comment header doesn't make sense (Markdown, TOML, lockfiles, `.gitignore`), add an
-annotation to `REUSE.toml` instead — match the license of the directory the file lives in. Run
-`reuse lint` before submitting; it must be clean.
+`examples/*` deliberately has **no** inline header — an inline SPDX tag on a file always wins over a
+`REUSE.toml` annotation for that same file, so adding one back to an example would silently override
+its `CC-BY-4.0` licensing. For it and any other file where a comment header doesn't make sense
+(Markdown, TOML, lockfiles, `.gitignore`), add an annotation to `REUSE.toml` instead — match the
+license of the directory the file lives in. Run `reuse lint` before submitting; it must be clean.
 
 ## Pull requests
 
