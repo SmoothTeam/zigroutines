@@ -38,7 +38,7 @@ test "parallel spawn counters" {
     const N: usize = 200;
     var i: usize = 0;
     while (i < N) : (i += 1) {
-        _ = try rt.spawn(.{ }, Counter.tick, .{});
+        _ = try rt.spawn(.{}, Counter.tick, .{});
     }
     try rt.run();
     try std.testing.expectEqual(N, Counter.n.load(.monotonic));

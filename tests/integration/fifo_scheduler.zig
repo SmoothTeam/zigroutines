@@ -86,7 +86,7 @@ test "many tasks with stack pool (batched)" {
     while (batch < 10) : (batch += 1) {
         var i: usize = 0;
         while (i < 100) : (i += 1) {
-            _ = try rt.spawn(.{ }, Counter.tick, .{});
+            _ = try rt.spawn(.{}, Counter.tick, .{});
         }
         try rt.run();
     }
