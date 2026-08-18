@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 Apanazar
+#
+# SPDX-License-Identifier: CC-BY-4.0
+
+name: Zig CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Test suite (unit + integration + io + C ABI)
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Build examples
+        run: zig build examples -Doptimize=ReleaseSafe
