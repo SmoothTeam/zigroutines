@@ -21,14 +21,31 @@ in Debug for reasons that have nothing to do with a real bug. See
 [`doc/testing.md`](doc/testing.md) for the suite map and what each layer (unit / integration / I/O /
 stress) is expected to cover.
 
+## Git hooks
+
+Tracked hooks live in [`.githooks/`](.githooks/):
+
+- `pre-commit` runs `zig fmt .` across the whole repo before each commit and re-stages whatever it
+  reformats, so formatting never drifts and the CI formatting check never fails on something that
+  should've been caught locally.
+- `commit-msg` lowercases the first letter after a `fix:`/`new:` prefix, matching this repo's commit
+  message convention.
+
+Git doesn't run tracked hooks automatically (by design — cloning a repo shouldn't execute arbitrary
+code), so opt in once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## License and REUSE
 
 This repo is [REUSE](https://reuse.software/)-compliant and licensed by directory:
 
 - `src/*`, `tests/*`, `include/*` — LGPL-3.0-or-later (SPDX header inline in each file)
 - `benchmarks/*` — LGPL-3.0-or-later (via `REUSE.toml`, no inline header)
-- `doc/*`, `examples/*`, `README.md`, `CHANGELOG.md`, `.gitignore`, `LICENSE` — CC-BY-4.0 (via
-  `REUSE.toml`, no inline header)
+- `doc/*`, `examples/*`, `.github/*`, `.githooks/*`, `README.md`, `CHANGELOG.md`, `.gitignore`,
+  `LICENSE` — CC-BY-4.0 (via `REUSE.toml`, no inline header)
 
 Every new source file under `src/`, `tests/`, or `include/` needs an SPDX header:
 
@@ -47,4 +64,8 @@ license of the directory the file lives in. Run `reuse lint` before submitting; 
 ## Pull requests
 
 Keep PRs scoped to one change. Make sure `zig build test -Doptimize=ReleaseSafe` and `reuse lint`
-both pass before opening.
+both pass before opening — see the PR template's checklist. Run `zig fmt .` too, but note that CI's
+formatting check is currently non-blocking (`continue-on-error`): this repo tracks Zig master, and
+`zig fmt`'s output can disagree between your locally-installed Zig and whatever nightly CI resolves
+`master` to on a given day. See the `fmt` job in `.github/workflows/ci-zig.yml` for the exact
+reasoning and when to turn the gate back on.

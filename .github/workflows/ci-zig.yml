@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Apanazar
+#
+# SPDX-License-Identifier: CC-BY-4.0
+
+name: Zig CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    # Non-blocking for now: this repo tracks Zig master, and `zig fmt`'s output shifts between
+    # nightly builds, so a contributor's locally-installed Zig can disagree with whatever CI
+    # happens to resolve `master` to on a given day. Drop `continue-on-error` once local/CI
+    # toolchains are pinned to the same version (see CONTRIBUTING.md).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Test suite (unit + integration + io + C ABI)
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Build examples
+        run: zig build examples -Doptimize=ReleaseSafe

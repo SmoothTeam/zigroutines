@@ -91,11 +91,11 @@ test "tcp echo loopback ephemeral port" {
         }
 
         fn driver(r: *zr.Runtime, io: zr.IoBackend, pch: *PortCh, rch: *ResultCh) void {
-            _ = r.spawn(.{ }, server, .{ io, pch }) catch {
+            _ = r.spawn(.{}, server, .{ io, pch }) catch {
                 rch.send(false) catch {};
                 return;
             };
-            _ = r.spawn(.{ }, clientTask, .{ io, pch, rch }) catch {
+            _ = r.spawn(.{}, clientTask, .{ io, pch, rch }) catch {
                 rch.send(false) catch {};
                 return;
             };
@@ -117,7 +117,7 @@ test "tcp echo loopback ephemeral port" {
         }
     };
 
-    _ = try rt.spawn(.{ }, S.driver, .{ &rt, bio, port_ch, result_ch });
+    _ = try rt.spawn(.{}, S.driver, .{ &rt, bio, port_ch, result_ch });
     try rt.run();
 
     const ok = result_ch.tryRecv() catch false;
@@ -208,7 +208,7 @@ test "tcp echo bind any address" {
         }
     };
 
-    _ = try rt.spawn(.{ }, S.work, .{ &rt, bio, result_ch });
+    _ = try rt.spawn(.{}, S.work, .{ &rt, bio, result_ch });
     try rt.run();
     try std.testing.expect(result_ch.tryRecv() catch false);
 }
@@ -294,7 +294,7 @@ test "udp loopback send recv" {
         }
     };
 
-    _ = try rt.spawn(.{ }, S.work, .{ &rt, bio, ok_ch });
+    _ = try rt.spawn(.{}, S.work, .{ &rt, bio, ok_ch });
     try rt.run();
     try std.testing.expect(ok_ch.tryRecv() catch false);
 }
@@ -561,7 +561,7 @@ test "io cancelAll unblocks waiters" {
         }
     };
     S.saw_err = false;
-    _ = try rt.spawn(.{ }, S.blocker, .{bio});
+    _ = try rt.spawn(.{}, S.blocker, .{bio});
     _ = try rt.spawn(.{}, S.canceler, .{bio});
     try rt.run();
     try std.testing.expect(S.saw_err);

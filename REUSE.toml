@@ -6,6 +6,16 @@ SPDX-FileCopyrightText = "2026 Apanazar"
 SPDX-License-Identifier = "CC-BY-4.0"
 
 [[annotations]]
+path = ".github/**"
+SPDX-FileCopyrightText = "2026 Apanazar"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = ".githooks/**"
+SPDX-FileCopyrightText = "2026 Apanazar"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
 path = "doc/**"
 SPDX-FileCopyrightText = "2026 Apanazar"
 SPDX-License-Identifier = "CC-BY-4.0"

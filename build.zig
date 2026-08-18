@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
     });
     c_abi_exe.root_module.addCSourceFile(.{
         .file = b.path("tests/abi/c_abi_main.c"),
-        .flags = &.{ "-std=c11" },
+        .flags = &.{"-std=c11"},
     });
     c_abi_exe.root_module.addIncludePath(b.path("include"));
     c_abi_exe.root_module.linkLibrary(c_lib);

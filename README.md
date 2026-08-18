@@ -1,10 +1,10 @@
-# 🧵 zigroutines
+# 🧵 Zigroutines
 
 Links for repositories: [![GitHub](https://img.shields.io/badge/GitHub-SmoothTeam%2Fzigroutines-181717?logo=github)](https://github.com/SmoothTeam/zigroutines)
 
-General information: [![Version](https://img.shields.io/github/v/tag/SmoothTeam/zigroutines?label=version&color=green)](https://github.com/SmoothTeam/zigroutines/tags) [![REUSE status](https://api.reuse.software/badge/github.com/SmoothTeam/zigroutines)](https://api.reuse.software/info/github.com/SmoothTeam/zigroutines) [![Zig](https://img.shields.io/badge/zig-0.17--dev.1503%2B-orange)](https://ziglang.org/)
+General information: [![Version](https://img.shields.io/github/v/tag/SmoothTeam/zigroutines?label=version&color=green)](https://github.com/SmoothTeam/zigroutines/tags) [![REUSE](https://github.com/SmoothTeam/zigroutines/actions/workflows/reuse.yml/badge.svg?branch=main)](https://github.com/SmoothTeam/zigroutines/actions/workflows/reuse.yml) [![Zig](https://img.shields.io/badge/zig-0.17--dev.1503%2B-orange)](https://ziglang.org/)
 
-Platforms: [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20FreeBSD-lightgrey)](README.md) [![Arch](https://img.shields.io/badge/arch-x86__64%20%7C%20aarch64-lightgrey)](README.md)
+Platforms: Platforms: [![Full support](https://img.shields.io/badge/full-Linux%20%7C%20Windows-brightgreen)](README.md) [![Context only](https://img.shields.io/badge/context%20switch%20only-macOS%20%7C%20FreeBSD-yellow)](README.md) [![Arch](https://img.shields.io/badge/arch-x86__64%20%7C%20aarch64-lightgrey)](README.md)
 
 Licensing: [![lib: LGPL-3.0-or-later](https://img.shields.io/badge/lib-LGPL--3.0--or--later-blue.svg)](LICENSES/LGPL-3.0-or-later.txt) [![docs: CC-BY-4.0](https://img.shields.io/badge/docs-CC--BY--4.0-blue.svg)](LICENSES/CC-BY-4.0.txt)
 
