@@ -1,0 +1,8 @@
+name: REUSE
+on:
+  push:
+    branches: [main, lib-rs]
+  pull_request:
+jobs:
+  reuse:
+    uses: SmoothTeam/.github/.github/workflows/reuse.yml@main
