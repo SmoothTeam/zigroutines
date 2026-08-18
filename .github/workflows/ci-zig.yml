@@ -19,6 +19,11 @@ jobs:
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
+    # Non-blocking for now: this repo tracks Zig master, and `zig fmt`'s output shifts between
+    # nightly builds, so a contributor's locally-installed Zig can disagree with whatever CI
+    # happens to resolve `master` to on a given day. Drop `continue-on-error` once local/CI
+    # toolchains are pinned to the same version (see CONTRIBUTING.md).
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

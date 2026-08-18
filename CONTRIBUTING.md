@@ -63,5 +63,9 @@ license of the directory the file lives in. Run `reuse lint` before submitting; 
 
 ## Pull requests
 
-Keep PRs scoped to one change. Make sure `zig build test -Doptimize=ReleaseSafe`, `zig fmt --check
-.`, and `reuse lint` all pass before opening — see the PR template's checklist.
+Keep PRs scoped to one change. Make sure `zig build test -Doptimize=ReleaseSafe` and `reuse lint`
+both pass before opening — see the PR template's checklist. Run `zig fmt .` too, but note that CI's
+formatting check is currently non-blocking (`continue-on-error`): this repo tracks Zig master, and
+`zig fmt`'s output can disagree between your locally-installed Zig and whatever nightly CI resolves
+`master` to on a given day. See the `fmt` job in `.github/workflows/ci-zig.yml` for the exact
+reasoning and when to turn the gate back on.

@@ -8,4 +8,4 @@
       a `REUSE.toml` annotation if a header doesn't fit the file format
 - [ ] `reuse lint` passes
 - [ ] `zig build test -Doptimize=ReleaseSafe` passes
-- [ ] `zig fmt --check .` is clean
+- [ ] `zig fmt .` applied (CI's formatting check is currently non-blocking, see `CONTRIBUTING.md`)
